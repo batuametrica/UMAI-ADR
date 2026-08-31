@@ -15,11 +15,14 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import yaml
 
 from .transcript import posture_preamble, to_adr_messages
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .config import StageConfig
 
 DETECTION_ROOT = Path(__file__).resolve().parents[2] / "Detection"
 
@@ -43,6 +46,22 @@ def load_detector_config(path: Optional[Path] = None) -> dict[str, Any]:
             return yaml.safe_load(f) or {}
     except OSError:
         return {}
+
+
+def _with_triage_model(config: dict[str, Any], model: str) -> dict[str, Any]:
+    """A copy of the detector config with the triage model replaced.
+
+    Copied rather than mutated: the same dict is handed to the reasoning stage,
+    and one stage must not be able to change the other's model.
+    """
+    updated = dict(config)
+    framework = dict(updated.get("adr_framework") or {})
+    key = "triage_llm" if "triage_llm" in framework else "triage_agent"
+    section = dict(framework.get(key) or {})
+    section["model"] = model
+    framework[key] = section
+    updated["adr_framework"] = framework
+    return updated
 
 
 @dataclass
@@ -73,20 +92,43 @@ class TriageOutcome:
 
 
 class TriageRunner:
-    """Runs ADR's triage stage against collected sessions."""
+    """Runs ADR's triage stage against collected sessions.
 
-    def __init__(self, config: Optional[dict[str, Any]] = None):
+    `stage` carries the model, endpoint and timeout for triage specifically.
+    Passing it is what lets a regulated customer run this stage on a model in
+    their own network while the reasoning stage runs elsewhere.
+    """
+
+    def __init__(
+        self,
+        config: Optional[dict[str, Any]] = None,
+        *,
+        stage: Optional["StageConfig"] = None,
+    ):
         _ensure_detection_importable()
 
         from guardrail.adr_agent.adr_baseline import ADSConfig, TriageLLM  # noqa: E402
         from openai_config import calculate_cost, get_openai_client  # noqa: E402
 
+        from .config import build_client  # noqa: PLC0415
+
         self._calculate_cost = calculate_cost
-        self._config = ADSConfig(config or load_detector_config())
-        self._triage = TriageLLM(get_openai_client(), self._config)
+        detector_config = config or load_detector_config()
+        if stage is not None:
+            # `TriageLLM` reads the model from the config, not from the client,
+            # so a per-stage model has to be written in here or it is ignored.
+            detector_config = _with_triage_model(detector_config, stage.model)
+        self._config = ADSConfig(detector_config)
+        self._stage = stage
+        # No stage config means the shared client, which is how the standalone
+        # scripts in `Detection/` still call this.
+        client = build_client(stage) if stage is not None else get_openai_client()
+        self._triage = TriageLLM(client, self._config)
 
     @property
     def model(self) -> str:
+        if self._stage is not None:
+            return self._stage.model
         return self._config.get_triage_model()
 
     def run(self, session: dict[str, Any]) -> TriageOutcome:
