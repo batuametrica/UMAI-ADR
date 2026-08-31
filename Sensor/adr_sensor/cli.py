@@ -54,9 +54,10 @@ Examples:
     )
     parser.add_argument(
         "--source",
-        choices=["claude", "cursor", "cline", "warp", "codex", "claude_desktop", "all"],
+        choices=["claude", "cursor", "cline", "warp", "codex", "claude_desktop", "all", "everything"],
         default="all",
-        help="Source to ingest logs from (default: all)",
+        help="Source to ingest logs from (default: all — Claude sources only; "
+        "use 'everything' for every supported agent)",
     )
     parser.add_argument(
         "--output-format",
@@ -81,6 +82,12 @@ Examples:
         "--all-history",
         action="store_true",
         help="Include all event logs regardless of age (default: last 2 weeks)",
+    )
+    parser.add_argument(
+        "--send",
+        action="store_true",
+        help="Ship collected sessions to the UMAI ingest endpoint "
+        "(requires UMAI_INGEST_ENDPOINT and UMAI_DEVICE_TOKEN)",
     )
 
     args = parser.parse_args()
@@ -122,6 +129,25 @@ Examples:
 
         # Display summary
         observer.display_summary(entries, system_config_data)
+
+        # UMAI: ship to the ingest endpoint. Independent of --no-save so a
+        # deployment can send without also leaving copies on the endpoint.
+        if args.send:
+            from .transport import TransportError, ship
+
+            try:
+                send_result = ship(entries)
+                print(
+                    f"Shipped {send_result.sessions_sent} session(s) in "
+                    f"{send_result.batches_sent} batch(es); "
+                    f"{send_result.sessions_skipped} unchanged since last run"
+                )
+                for error in send_result.errors:
+                    success = False
+                    print(f"  Ingest error: {error}")
+            except TransportError as e:
+                success = False
+                print(f"Ingest failed: {e}")
 
         # Save
         if entries or system_config_data:

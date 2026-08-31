@@ -231,6 +231,10 @@ class ClaudeParser(BaseParser):
                 session_id=f"claude_{session_id}",
                 project_path=session_data["project_path"],
                 model=session_data["model"],
+                # UMAI: populated like codex/warp already do. Sub-agent
+                # (sidechain) runs share their parent's sessionId across
+                # separate files, so the path is the only stable identity.
+                raw_log_path=str(file_path),
             )
 
             pending_tools: Dict[str, ToolUsage] = {}

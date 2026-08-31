@@ -26,6 +26,11 @@ from .schemas.agent_event_schema import AgentEvent
 from .schemas.system_config_schema import SystemConfiguration
 from .utils.timestamp_utils import format_timestamp_for_filename, normalize_timestamp, parse_timestamp_from_filename
 
+# UMAI: sources collected when no explicit `--source` is given. Scoped to Claude
+# while that is the product's coverage claim; widen only alongside the analysis
+# that justifies holding the data.
+DEFAULT_SOURCES = ("claude", "claude_desktop")
+
 
 class AgentObserver:
     """Main class for observing and analyzing AI agent interactions.
@@ -85,13 +90,27 @@ class AgentObserver:
 
         return cache_dir / "adr_sensor"
 
+    def _should_ingest(self, source: str, source_filter: str) -> bool:
+        """UMAI: decide whether one source runs under the current filter.
+
+        `all` deliberately means *Claude only*. Collecting transcripts we do not
+        analyse is data we cannot justify holding, so the other agents ship but
+        stay opt-in behind `--source <name>` or `--source everything`.
+        """
+        if source_filter == "everything":
+            return True
+        if source_filter == "all":
+            return source in DEFAULT_SOURCES
+        return source_filter == source
+
     def ingest_all(
         self, source_filter: str = "all"
     ) -> Tuple[List[AgentEvent], List[SystemConfiguration]]:
-        """Ingest logs from all supported sources.
+        """Ingest logs from the selected sources.
 
         Args:
-            source_filter: Which source to ingest. One of 'all', 'claude', 'cursor',
+            source_filter: 'all' (Claude sources only — see `_should_ingest`),
+                'everything' (all supported agents), or one of 'claude', 'cursor',
                 'cline', 'warp', 'codex', 'claude_desktop'.
 
         Returns:
@@ -105,7 +124,7 @@ class AgentObserver:
         print("=" * 80 + "\n")
 
         # Parse Claude Code logs
-        if source_filter in ["all", "claude"]:
+        if self._should_ingest("claude", source_filter):
             print("Ingesting Claude Code logs...")
             try:
                 claude_entries = self.claude_parser.parse_all()
@@ -123,7 +142,7 @@ class AgentObserver:
                 })
 
         # Parse Cursor logs
-        if source_filter in ["all", "cursor"]:
+        if self._should_ingest("cursor", source_filter):
             print("Ingesting Cursor logs...")
             try:
                 cursor_entries = self.cursor_parser.parse_all()
@@ -140,8 +159,10 @@ class AgentObserver:
                     "trace": traceback.format_exc(limit=5),
                 })
 
-        # Parse Claude Desktop Agent Mode logs (macOS only)
-        if source_filter in ["all", "claude_desktop"] and platform.system() == "Darwin":
+        # Parse Claude Desktop Agent Mode logs
+        # UMAI: was gated to macOS. Windows uses a different on-disk layout
+        # (sidecar + Claude Code transcript), handled inside the parser.
+        if self._should_ingest("claude_desktop", source_filter):
             print("Ingesting Claude Desktop Agent Mode logs...")
             try:
                 desktop_entries = self.claude_desktop_parser.parse_all()
@@ -159,7 +180,7 @@ class AgentObserver:
                 })
 
         # Parse Cline logs
-        if source_filter in ["all", "cline"]:
+        if self._should_ingest("cline", source_filter):
             print("Ingesting Cline logs...")
             try:
                 cline_entries = self.cline_parser.parse_all()
@@ -177,7 +198,7 @@ class AgentObserver:
                 })
 
         # Parse Warp logs
-        if source_filter in ["all", "warp"]:
+        if self._should_ingest("warp", source_filter):
             print("Ingesting Warp Terminal logs...")
             try:
                 warp_entries = self.warp_parser.parse_all()
@@ -195,7 +216,7 @@ class AgentObserver:
                 })
 
         # Parse Codex logs
-        if source_filter in ["all", "codex"]:
+        if self._should_ingest("codex", source_filter):
             print("Ingesting Codex logs...")
             try:
                 codex_entries = self.codex_parser.parse_all()
@@ -212,7 +233,37 @@ class AgentObserver:
                     "trace": traceback.format_exc(limit=5),
                 })
 
+        all_entries = self._drop_transcripts_claimed_by_desktop(all_entries)
+
         return all_entries, system_config_data
+
+    def _drop_transcripts_claimed_by_desktop(self, entries: List[AgentEvent]) -> List[AgentEvent]:
+        """UMAI: de-duplicate agent-mode sessions across the two parsers.
+
+        On the sidecar layout, Claude Desktop agent mode delegates to Claude
+        Code, so the same transcript is reachable from both. Keep the Desktop
+        copy — it carries session posture (permission mode, connected MCP
+        servers) that the bare transcript does not.
+
+        Matching is by transcript path, not session id: sub-agent (sidechain)
+        runs carry their parent's session id in files of their own, and are
+        real activity that must survive de-duplication.
+        """
+        claimed = getattr(self.claude_desktop_parser, "claimed_transcript_paths", set())
+        if not claimed:
+            return entries
+
+        kept = [
+            entry
+            for entry in entries
+            if not (entry.source == "claude" and entry.raw_log_path in claimed)
+        ]
+
+        dropped = len(entries) - len(kept)
+        if dropped:
+            print(f"Merged {dropped} Claude Code entries into Desktop agent sessions\n")
+
+        return kept
 
     def display_summary(
         self, entries: List[AgentEvent], system_config_data: List[SystemConfiguration]

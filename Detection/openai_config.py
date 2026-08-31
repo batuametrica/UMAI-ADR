@@ -33,7 +33,17 @@ def get_openai_client() -> OpenAI:
     Returns:
         OpenAI: Configured client
     """
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    # UMAI: honour OPENAI_BASE_URL so the triage stage can run against a
+    # locally hosted, OpenAI-compatible model. Regulated customers cannot send
+    # session transcripts to a US API, so a sovereign endpoint is the default
+    # deployment rather than an option.
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+    api_key = os.environ.get("OPENAI_API_KEY") or ("local" if base_url else None)
+    if not api_key:
+        raise KeyError("OPENAI_API_KEY")
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key)
 
 
 def get_openai_config() -> Dict[str, Any]:

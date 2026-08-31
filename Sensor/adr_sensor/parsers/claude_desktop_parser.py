@@ -1,6 +1,14 @@
 """
 Parser for Claude Desktop Agent Mode (local agent mode) logs.
-Reads audit.jsonl files from local-agent-mode-sessions directories.
+
+Two on-disk layouts exist, selected by platform:
+
+* macOS   — `local-agent-mode-sessions/<user>/<org>/local_<uuid>/audit.jsonl`,
+            a self-contained audit log per session.
+* Windows — `claude-code-sessions/<user>/<org>/local_<uuid>.json`, a metadata
+            sidecar whose `cliSessionId` points at a Claude Code transcript
+            under `~/.claude/projects/`. Agent mode delegates to Claude Code
+            there, so the transcript lives in the Claude Code store.
 
 Memory-optimized: Streams audit.jsonl line-by-line, skips thinking blocks,
 truncates large tool results, and filters by session age.
@@ -11,12 +19,14 @@ Performance-optimized: Skips sessions older than 2 weeks based on lastActivityAt
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
+from .. import platform_paths
 from ..schemas.agent_event_schema import AgentEvent, ChatMessage, ToolUsage
 from ..utils.string_utils import truncate_middle
 from ..utils.timestamp_utils import normalize_timestamp
 from .base_parser import BaseParser
+from .claude_parser import ClaudeParser
 
 MAX_LOG_AGE_DAYS = 14
 
@@ -25,22 +35,49 @@ DEFAULT_BASE_PATH = "~/Library/Application Support/Claude/local-agent-mode-sessi
 
 
 class ClaudeDesktopParser(BaseParser):
-    """Parser for Claude Desktop Agent Mode audit.jsonl log files."""
+    """Parser for Claude Desktop Agent Mode sessions (both on-disk layouts)."""
 
     def __init__(self, max_age_days: int = MAX_LOG_AGE_DAYS, base_path: Optional[str] = None):
+        # UMAI: layout and root now resolve per platform. An explicit base_path
+        # still wins and is assumed to be the macOS audit.jsonl layout, which is
+        # what upstream callers and the existing tests pass.
         if base_path:
             self.base_path = Path(base_path)
+            self.layout = platform_paths.LAYOUT_AUDIT_JSONL
         else:
-            self.base_path = Path(DEFAULT_BASE_PATH).expanduser()
+            located = platform_paths.agent_mode_session_root()
+            if located:
+                self.layout, self.base_path = located
+            else:
+                self.layout = platform_paths.LAYOUT_AUDIT_JSONL
+                self.base_path = Path(DEFAULT_BASE_PATH).expanduser()
+
         self.max_age_days = max_age_days
+
+        # UMAI: Claude Code transcript files consumed by the sidecar layout.
+        # The observer drops the duplicate `claude`-sourced copy of exactly
+        # these files — matching on session id instead would also discard the
+        # sub-agent (sidechain) runs, which share their parent's session id but
+        # live in their own files.
+        self.claimed_transcript_paths: Set[str] = set()
+        self._transcript_index: Optional[Dict[str, Path]] = None
 
     def parse_all(self) -> List[AgentEvent]:
         """Parse all available Claude Desktop agent mode sessions."""
-        entries = []
+        self.claimed_transcript_paths = set()
 
         if not self.base_path.exists():
             print(f"[CLAUDE_DESKTOP] No sessions found at {self.base_path}")
-            return entries
+            return []
+
+        if self.layout == platform_paths.LAYOUT_SIDECAR:
+            return self._parse_sidecar_layout()
+
+        return self._parse_audit_jsonl_layout()
+
+    def _parse_audit_jsonl_layout(self) -> List[AgentEvent]:
+        """macOS layout: one audit.jsonl per session directory."""
+        entries = []
 
         session_dirs = self._discover_sessions()
         print(f"[CLAUDE_DESKTOP] Found {len(session_dirs)} session directories")
@@ -82,6 +119,140 @@ class ClaudeDesktopParser(BaseParser):
         print(f"[CLAUDE_DESKTOP] Processed {processed_count} sessions")
 
         return entries
+
+    # ------------------------------------------------------------------
+    # UMAI: sidecar layout (Windows)
+    # ------------------------------------------------------------------
+
+    def _parse_sidecar_layout(self) -> List[AgentEvent]:
+        """Windows layout: metadata sidecar joined to a Claude Code transcript."""
+        sidecars = sorted(self.base_path.glob("*/*/local_*.json"))
+        print(f"[CLAUDE_DESKTOP] Found {len(sidecars)} session sidecars")
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=self.max_age_days)
+        entries = []
+        skipped_count = 0
+        unresolved_count = 0
+
+        for sidecar_path in sidecars:
+            metadata = self._read_session_metadata(sidecar_path)
+            if not metadata:
+                continue
+
+            timestamp = self._sidecar_timestamp(metadata, sidecar_path)
+            if timestamp < cutoff_time:
+                skipped_count += 1
+                continue
+
+            entry = self._parse_sidecar_session(metadata, timestamp)
+            if entry is None:
+                unresolved_count += 1
+                continue
+
+            if entry.has_meaningful_content():
+                entries.append(entry)
+
+        if skipped_count:
+            print(f"[CLAUDE_DESKTOP] Skipped {skipped_count} sessions older than {self.max_age_days} days")
+        if unresolved_count:
+            print(f"[CLAUDE_DESKTOP] {unresolved_count} sidecars had no matching transcript")
+        print(f"[CLAUDE_DESKTOP] Processed {len(entries)} sessions")
+
+        return entries
+
+    def _sidecar_timestamp(self, metadata: Dict[str, Any], sidecar_path: Path) -> datetime:
+        """Best available activity time for a sidecar, newest signal first."""
+        for key in ("lastActivityAt", "lastFocusedAt", "createdAt"):
+            value = metadata.get(key)
+            if value is None:
+                continue
+            try:
+                return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+            except (ValueError, OSError, OverflowError, TypeError):
+                continue
+
+        try:
+            return datetime.fromtimestamp(sidecar_path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            return datetime.now(timezone.utc)
+
+    def _transcript_by_cli_session_id(self) -> Dict[str, Path]:
+        """Index Claude Code transcripts by session id, built once per run."""
+        if self._transcript_index is not None:
+            return self._transcript_index
+
+        index: Dict[str, Path] = {}
+        for root in platform_paths.claude_code_projects():
+            for transcript in root.glob("**/*.jsonl"):
+                index.setdefault(transcript.stem, transcript)
+
+        self._transcript_index = index
+        return index
+
+    def _parse_sidecar_session(
+        self, metadata: Dict[str, Any], timestamp: datetime
+    ) -> Optional[AgentEvent]:
+        """Build one AgentEvent from a sidecar plus its Claude Code transcript."""
+        cli_session_id = metadata.get("cliSessionId")
+        if not cli_session_id:
+            return None
+
+        transcript_path = self._transcript_by_cli_session_id().get(cli_session_id)
+        if transcript_path is None:
+            return None
+
+        try:
+            # Age was already decided from the sidecar; don't re-filter here.
+            transcript_events = ClaudeParser(max_age_days=10**6).parse_jsonl_file(transcript_path)
+        except Exception as e:
+            print(f"[CLAUDE_DESKTOP] Error reading transcript {transcript_path}: {e}")
+            return None
+
+        chat_history: List[ChatMessage] = []
+        for event in transcript_events:
+            if event.session_id == f"claude_{cli_session_id}":
+                chat_history = list(event.chat_history)
+                break
+        else:
+            if transcript_events:
+                chat_history = list(transcript_events[0].chat_history)
+
+        self.claimed_transcript_paths.add(str(transcript_path))
+
+        session_id = metadata.get("sessionId", "")
+        session_uuid = session_id[6:] if session_id.startswith("local_") else session_id
+
+        session_context: Dict[str, Any] = {"posture": self._extract_posture(metadata)}
+        if metadata.get("title"):
+            session_context["title"] = metadata["title"]
+        session_context["cli_session_id"] = cli_session_id
+
+        return AgentEvent(
+            timestamp=timestamp,
+            source="claude_desktop",
+            session_id=f"claude_desktop_{session_uuid}",
+            project_path=metadata.get("cwd") or metadata.get("originCwd"),
+            model=metadata.get("model"),
+            chat_history=chat_history,
+            raw_log_path=str(transcript_path),
+            session_context=session_context,
+        )
+
+    def _extract_posture(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Security-relevant session configuration.
+
+        These fields answer "what was this session allowed to do" without
+        reading a single message, and drive detection independently of content.
+        """
+        return {
+            "permission_mode": metadata.get("permissionMode"),
+            "chrome_permission_mode": metadata.get("chromePermissionMode"),
+            "remote_mcp_servers": metadata.get("remoteMcpServersConfig") or [],
+            "always_allowed_reasons": metadata.get("alwaysAllowedReasons") or [],
+            "session_permission_updates": metadata.get("sessionPermissionUpdates") or [],
+            "effort": metadata.get("effort"),
+            "completed_turns": metadata.get("completedTurns"),
+        }
 
     def _discover_sessions(self) -> List[tuple]:
         """Discover session directories and their metadata files.
@@ -228,6 +399,17 @@ class ClaudeDesktopParser(BaseParser):
             session_context["title"] = title
         if init_data:
             session_context["init"] = init_data
+            # UMAI: mirror the sidecar layout's posture shape so downstream
+            # consumers read one key regardless of platform.
+            session_context["posture"] = {
+                "permission_mode": init_data.get("permission_mode"),
+                "chrome_permission_mode": None,
+                "remote_mcp_servers": init_data.get("mcp_servers") or [],
+                "always_allowed_reasons": [],
+                "session_permission_updates": [],
+                "effort": None,
+                "completed_turns": None,
+            }
 
         entry = AgentEvent(
             timestamp=timestamp,
