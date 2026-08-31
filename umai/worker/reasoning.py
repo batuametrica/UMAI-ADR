@@ -104,12 +104,22 @@ class ReasoningOutcome:
     cost_usd: Optional[float] = None
 
     def to_result(self, tenant_id: str, session_key: str, threat_tactic: Optional[str]) -> dict[str, Any]:
+        """Shape the outcome for `POST /internal/analysis/result`.
+
+        The technique goes in its own field. It used to be packed into
+        `threat_tactic` because the platform had nowhere else to put it —
+        which left the tactic column holding technique ids and the technique
+        columns empty, so QRadar rules could not pivot on ADR.TXXXX and
+        grouping by tactic was wrong. The platform now types both
+        (UMA-40 contract, UMA-44 migration).
+        """
         return {
             "tenant_id": tenant_id,
             "session_key": session_key,
             "stage": "reason",
             "verdict": self.verdict,
-            "threat_tactic": self.technique_id or threat_tactic,
+            "technique_id": self.technique_id,
+            "threat_tactic": threat_tactic,
             "confidence": self.confidence,
             "reason": self.explanation,
             "model": self.model,
