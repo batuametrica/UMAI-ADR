@@ -1,0 +1,24 @@
+# Keep the worker build context to committed sources only. Stray __pycache__
+# directories under umai/ and Detection/guardrail/ would otherwise be copied into
+# the image and break byte reproducibility.
+.git
+.gitignore
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+.env.*
+.idea
+.vscode
+build/
+dist/
+dist-repro-*/
+Sensor/packaging/windows/build
+Sensor/packaging/windows/dist
+tests

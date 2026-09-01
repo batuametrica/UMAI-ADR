@@ -1,5 +1,5 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="UMAI ADR Collector" Manufacturer="UMAI" Version="$(var.Version)"
+  <Package ProductCode="$(var.ProductCode)" Name="UMAI ADR Collector" Manufacturer="UMAI" Version="$(var.Version)"
            UpgradeCode="7C39F537-6B58-474E-B5AC-3E9B98C1A643" Language="1033" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer UMAI ADR Collector is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />

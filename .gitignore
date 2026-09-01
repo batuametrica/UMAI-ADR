@@ -8,6 +8,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+dist-repro-*/
 *.egg
 
 # Test and tooling caches
