@@ -102,4 +102,19 @@ $summary.Persist()
 # Normalize that final metadata field to make the unsigned MSI byte-reproducible.
 Set-MsiCompoundTimestamp -Path (Resolve-Path $msiPath).Path -Epoch ([long]$SourceDateEpoch)
 
+# The payload digest is recorded so a consumer can check the embedded collector as
+# well as the installer wrapping it. Written by the build rather than recomputed later,
+# because after signing the MSI the payload can no longer be extracted byte-identically.
+[ordered]@{
+    version = $Version
+    payload_sha256 = $payloadHash.ToLowerInvariant()
+    product_code = $productCode
+    package_code = $packageCode
+} | ConvertTo-Json | ForEach-Object {
+    [IO.File]::WriteAllText(
+        (Join-Path $OutputDirectory 'build-metadata.json'),
+        "$_`n",
+        (New-Object Text.UTF8Encoding $false))
+}
+
 Write-Host "Built $msiPath"
