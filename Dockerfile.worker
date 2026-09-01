@@ -1,0 +1,27 @@
+FROM python:3.12.6-slim-bookworm
+
+ARG UMAI_WORKER_VERSION=0.0.0-dev
+LABEL org.opencontainers.image.title="UMAI ADR Worker" \
+      org.opencontainers.image.version="${UMAI_WORKER_VERSION}" \
+      org.opencontainers.image.vendor="UMAI" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY worker-requirements.txt .
+RUN pip install --requirement worker-requirements.txt \
+    && groupadd --system umai \
+    && useradd --system --gid umai --home-dir /app --shell /usr/sbin/nologin umai
+
+COPY umai ./umai
+COPY Detection/config_detector.yaml ./Detection/config_detector.yaml
+COPY Detection/openai_config.py ./Detection/openai_config.py
+COPY Detection/guardrail ./Detection/guardrail
+RUN chown -R umai:umai /app
+USER umai
+
+EXPOSE 9100
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=3)"
+ENTRYPOINT ["python", "-m", "umai.worker"]

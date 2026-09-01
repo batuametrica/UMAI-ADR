@@ -95,3 +95,14 @@ class PlatformClient:
 
     def submit(self, result: dict[str, Any]) -> dict[str, Any]:
         return json.loads(self._request("POST", "/internal/analysis/result", result))
+
+    def release(self, stage: str, sessions: list[dict[str, Any]]) -> int:
+        if not sessions:
+            return 0
+        payload = {
+            "stage": stage,
+            "worker_id": self.config.worker_id,
+            "sessions": [[str(item["tenant_id"]), item["session_key"]] for item in sessions],
+        }
+        response = json.loads(self._request("POST", "/internal/analysis/release", payload))
+        return int(response.get("released") or 0)

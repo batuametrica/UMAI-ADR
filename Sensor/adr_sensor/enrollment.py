@@ -28,10 +28,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import __version__
+from .network import urlopen
 
 # Renew this far ahead of expiry, so a run that starts just before the deadline
 # does not race it.
 RENEW_BEFORE_SECONDS = 60 * 60 * 6
+SUPPORTED_SOURCES = ("claude", "claude_desktop", "cline", "codex", "cursor", "warp")
 
 
 class EnrollmentError(RuntimeError):
@@ -44,6 +46,8 @@ class DeviceCredentials:
     device_id: str
     device_token: str
     expires_at: int
+    collection_mode: str = "posture_only"
+    config_etag: str = ""
 
     @property
     def expired(self) -> bool:
@@ -62,9 +66,12 @@ class CredentialStore:
 
     @staticmethod
     def _default_path() -> Path:
-        override = os.environ.get("UMAI_SENSOR_STATE_DIR")
+        override = os.environ.get("UMAI_ADR_STATE_DIR")
         if override:
             return Path(override) / "device.json"
+        if os.name == "nt":
+            program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+            return Path(program_data) / "UMAI" / "ADR Collector" / "state" / "device.json"
         cache_home = os.environ.get("XDG_CACHE_HOME")
         base = Path(cache_home) if cache_home else Path.home() / ".cache"
         return base / "adr_sensor" / "device.json"
@@ -73,23 +80,37 @@ class CredentialStore:
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
+            token = data.get("device_token")
+            if data.get("token_protection") == "dpapi-local-machine":
+                token = _dpapi_unprotect(self.token_path.read_bytes()).decode("utf-8")
             return DeviceCredentials(
                 tenant_id=str(data["tenant_id"]),
                 device_id=str(data["device_id"]),
-                device_token=str(data["device_token"]),
+                device_token=str(token),
                 expires_at=int(data["expires_at"]),
+                collection_mode=str(data.get("collection_mode") or "posture_only"),
+                config_etag=str(data.get("config_etag") or ""),
             )
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, EnrollmentError):
             return None
+
+    @property
+    def token_path(self) -> Path:
+        return self.path.with_name("device-token.dpapi")
 
     def save(self, credentials: DeviceCredentials) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "tenant_id": credentials.tenant_id,
             "device_id": credentials.device_id,
-            "device_token": credentials.device_token,
             "expires_at": credentials.expires_at,
+            "collection_mode": credentials.collection_mode,
+            "config_etag": credentials.config_etag,
         }
+        if os.name == "nt":
+            payload["token_protection"] = "dpapi-local-machine"
+        else:
+            payload["device_token"] = credentials.device_token
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.parent / f".device.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -99,6 +120,14 @@ class CredentialStore:
         except OSError:
             # Windows ignores POSIX modes; NTFS ACLs are the deployment's job.
             pass
+        if os.name == "nt":
+            encrypted = _dpapi_protect(credentials.device_token.encode("utf-8"))
+            token_tmp = self.token_path.with_suffix(f".dpapi.{os.getpid()}.tmp")
+            token_tmp.write_bytes(encrypted)
+            os.replace(token_tmp, self.token_path)
+        # Metadata is the commit marker. On Windows the protected token lands
+        # first, so a crash can never expose metadata that points at a missing
+        # credential blob.
         os.replace(tmp, self.path)
 
     def device_id(self) -> str:
@@ -112,6 +141,46 @@ class CredentialStore:
         except Exception:
             hostname = "unknown"
         return f"{hostname}-{uuid.uuid4().hex[:12]}"
+
+
+def _dpapi_protect(data: bytes) -> bytes:
+    """Protect bytes using Windows DPAPI with machine scope and no UI."""
+    if os.name != "nt":
+        raise EnrollmentError("DPAPI is only available on Windows")
+    return _crypt_protect_data(data, decrypt=False)
+
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    if os.name != "nt":
+        raise EnrollmentError("DPAPI is only available on Windows")
+    return _crypt_protect_data(data, decrypt=True)
+
+
+def _crypt_protect_data(data: bytes, *, decrypt: bool) -> bytes:
+    """Small ctypes binding kept local so the collector has no Windows-only dependency."""
+    import ctypes
+    from ctypes import wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+    buffer = ctypes.create_string_buffer(data)
+    source = DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    output = DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    flags = 0x1  # CRYPTPROTECT_UI_FORBIDDEN
+    if not decrypt:
+        flags |= 0x4  # CRYPTPROTECT_LOCAL_MACHINE
+        ok = crypt32.CryptProtectData(ctypes.byref(source), None, None, None, None, flags, ctypes.byref(output))
+    else:
+        ok = crypt32.CryptUnprotectData(ctypes.byref(source), None, None, None, None, flags, ctypes.byref(output))
+    if not ok:
+        raise EnrollmentError(f"Windows DPAPI operation failed ({ctypes.GetLastError()})")
+    try:
+        return ctypes.string_at(output.pbData, output.cbData)
+    finally:
+        kernel32.LocalFree(output.pbData)
 
 
 def _post_json(
@@ -128,7 +197,7 @@ def _post_json(
 
     request = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:200]
@@ -144,6 +213,8 @@ def _credentials_from_response(data: dict[str, Any]) -> DeviceCredentials:
             device_id=str(data["device_id"]),
             device_token=str(data["device_token"]),
             expires_at=int(data["expires_at"]),
+            collection_mode=str(data.get("collection_mode") or "posture_only"),
+            config_etag=str(data.get("config_etag") or ""),
         )
     except (KeyError, TypeError, ValueError) as e:
         raise EnrollmentError(f"Malformed enrolment response: {e}") from e
@@ -161,10 +232,11 @@ def bootstrap(endpoint: str, *, bootstrap_token: str, tenant_id: str, timeout: i
         "hostname": socket.gethostname(),
         "os": platform.system(),
         "os_version": platform.release(),
-        "agent_version": __version__,
+        "collector_version": __version__,
+        "supported_sources": list(SUPPORTED_SOURCES),
     }
     data = _post_json(
-        f"{endpoint}/api/v1/sensor/bootstrap",
+        f"{endpoint}/api/v1/adr/bootstrap",
         token=bootstrap_token,
         body=body,
         timeout=timeout,
@@ -181,7 +253,7 @@ def renew(endpoint: str, credentials: DeviceCredentials, *, timeout: int = 30,
     """Exchange the current device token for a fresh one."""
     store = store or CredentialStore()
     data = _post_json(
-        f"{endpoint}/api/v1/sensor/renew",
+        f"{endpoint}/api/v1/adr/renew",
         token=credentials.device_token,
         body=None,
         timeout=timeout,

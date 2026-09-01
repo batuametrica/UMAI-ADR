@@ -97,6 +97,15 @@ class TestSessionState:
         pending, skipped = SessionState(path=path).pending([make_event("s1")])
         assert len(pending) == 1 and skipped == 0
 
+    def test_last_successful_ingest_is_persisted_separately(self, tmp_path):
+        path = tmp_path / "state.json"
+        state = SessionState(path=path)
+        state.last_successful_ingest_at = "2026-08-31T12:00:00+00:00"
+        state.save()
+
+        reloaded = SessionState(path=path)
+        assert reloaded.last_successful_ingest_at == "2026-08-31T12:00:00+00:00"
+
 
 class TestBatching:
     def _client(self, max_batch_bytes):
@@ -140,7 +149,50 @@ class TestConfig:
         monkeypatch.setenv("UMAI_DEVICE_TOKEN", "token")
 
         config = IngestConfig.from_env()
-        assert IngestClient(config).url == "https://umai.example.com/api/v1/sensor/sessions"
+        assert IngestClient(config).url == "https://umai.example.com/api/v1/adr/sessions"
+
+    def test_device_header_is_sent_when_enrolled(self):
+        client = IngestClient(
+            IngestConfig(
+                endpoint="https://umai.example.com",
+                device_token="token",
+                tenant_id="11111111-1111-1111-1111-111111111111",
+                device_id="collector-01",
+            )
+        )
+        assert client._headers()["X-Device-Id"] == "collector-01"
+
+    def test_heartbeat_reports_version_os_capabilities_and_health(self, monkeypatch):
+        client = IngestClient(
+            IngestConfig(
+                endpoint="https://umai.example.com",
+                device_token="token",
+                tenant_id="11111111-1111-1111-1111-111111111111",
+                device_id="collector-01",
+                config_etag='"adr-old"',
+            )
+        )
+        captured = {}
+
+        def fake_post(body):
+            captured.update(body)
+            return {"config_etag": '"adr-new"', "collection_mode": "metadata"}
+
+        monkeypatch.setattr(client, "_post_heartbeat", fake_post)
+        client.heartbeat(
+            observed_sources=["codex", "claude", "codex"],
+            pending_sessions=3,
+            last_successful_ingest_at="2026-08-31T12:00:00+00:00",
+            status="degraded",
+            status_detail="PARTIAL_INGEST",
+        )
+
+        assert captured["collector_version"]
+        assert captured["os"] and captured["os_version"]
+        assert captured["supported_sources"]
+        assert captured["observed_sources"] == ["claude", "codex"]
+        assert captured["status_detail"] == "PARTIAL_INGEST"
+        assert client.config.config_etag == '"adr-new"'
 
     def test_malformed_numeric_setting_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("UMAI_INGEST_ENDPOINT", "https://umai.example.com")

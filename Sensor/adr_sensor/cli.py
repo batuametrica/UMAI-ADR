@@ -89,8 +89,21 @@ Examples:
         help="Ship collected sessions to the UMAI ingest endpoint "
         "(requires UMAI_INGEST_ENDPOINT and UMAI_DEVICE_TOKEN)",
     )
+    parser.add_argument(
+        "--support-bundle",
+        type=Path,
+        metavar="ZIP_PATH",
+        help="Create a redacted diagnostics bundle and exit",
+    )
 
     args = parser.parse_args()
+
+    if args.support_bundle:
+        from .support_bundle import create_support_bundle
+
+        bundle = create_support_bundle(args.support_bundle)
+        print(f"Support bundle created: {bundle}")
+        return
 
     host_os = platform.system()
     capture_resource = bool(args.resource and host_os != "Windows" and resource_mod is not None)

@@ -1,0 +1,60 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="UMAI ADR Collector" Manufacturer="UMAI" Version="$(var.Version)"
+           UpgradeCode="7C39F537-6B58-474E-B5AC-3E9B98C1A643" Language="1033" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer UMAI ADR Collector is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="UMAI ADR Collector">
+        <Component Id="CollectorFiles" Guid="9D667AA2-0636-4DE1-AF79-45F17C76758E">
+          <File Id="CollectorExe" Source="$(var.PayloadDir)\umai-adr-collector.exe" KeyPath="yes" />
+          <File Id="RunnerScript" Source="$(var.SourceDir)\Run-Collector.ps1" />
+          <File Id="EnrollScript" Source="$(var.SourceDir)\Enroll-Collector.ps1" />
+          <File Id="InstallTaskScript" Source="$(var.SourceDir)\Install-ScheduledTask.ps1" />
+          <File Id="UninstallTaskScript" Source="$(var.SourceDir)\Uninstall-ScheduledTask.ps1" />
+          <File Id="SupportBundleScript" Source="$(var.SourceDir)\New-SupportBundle.ps1" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ProgramDataUMAI" Name="UMAI">
+        <Directory Id="ProgramDataRoot" Name="ADR Collector">
+          <Directory Id="ConfigFolder" Name="config" />
+          <Directory Id="StateFolder" Name="state" />
+          <Directory Id="LogsFolder" Name="logs" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Component Id="ProgramDataFolders" Directory="ProgramDataRoot" Guid="D592E0B4-DB2A-4A3F-89E5-85AA7B547E24">
+      <CreateFolder />
+    </Component>
+    <Component Id="ConfigDirectory" Directory="ConfigFolder" Guid="CE453744-48DE-4E88-B323-A928E39A4566">
+      <CreateFolder />
+    </Component>
+    <Component Id="StateDirectory" Directory="StateFolder" Guid="28527FA9-A8CF-4FF5-A995-C5A82FB83586" Permanent="yes">
+      <CreateFolder />
+    </Component>
+    <Component Id="LogsDirectory" Directory="LogsFolder" Guid="2363B048-E2DB-4E33-B425-5275119BE2E8">
+      <CreateFolder />
+    </Component>
+
+    <CustomAction Id="RegisterCollectorTask" Directory="INSTALLFOLDER" Execute="deferred" Impersonate="no"
+                  ExeCommand="[System64Folder]WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]Install-ScheduledTask.ps1&quot;" Return="check" />
+    <CustomAction Id="RemoveCollectorTask" Directory="INSTALLFOLDER" Execute="deferred" Impersonate="no"
+                  ExeCommand="[System64Folder]WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]Uninstall-ScheduledTask.ps1&quot;" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RegisterCollectorTask" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="RemoveCollectorTask" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Complete" Title="UMAI ADR Collector" Level="1">
+      <ComponentRef Id="CollectorFiles" />
+      <ComponentRef Id="ProgramDataFolders" />
+      <ComponentRef Id="ConfigDirectory" />
+      <ComponentRef Id="StateDirectory" />
+      <ComponentRef Id="LogsDirectory" />
+    </Feature>
+  </Package>
+</Wix>

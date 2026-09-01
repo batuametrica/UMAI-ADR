@@ -17,17 +17,20 @@ Hashing the conversation catches append-only growth correctly.
 import gzip
 import json
 import os
+import platform
 import random
 import socket
-import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
+from .enrollment import SUPPORTED_SOURCES
+from .network import urlopen
 from .schemas.agent_event_schema import AgentEvent
 
 DEFAULT_TIMEOUT_SECONDS = 60
@@ -62,6 +65,8 @@ class IngestConfig:
     endpoint: str
     device_token: str
     tenant_id: Optional[str] = None
+    device_id: Optional[str] = None
+    config_etag: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
@@ -91,6 +96,8 @@ class IngestConfig:
         timeout = _int("UMAI_INGEST_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
         token = os.environ.get("UMAI_DEVICE_TOKEN", "").strip()
         tenant_id = os.environ.get("UMAI_TENANT_ID", "").strip() or None
+        device_id = os.environ.get("UMAI_DEVICE_ID", "").strip() or None
+        config_etag = os.environ.get("UMAI_CONFIG_ETAG", "").strip() or None
 
         if not token:
             from .enrollment import ensure_credentials
@@ -103,11 +110,15 @@ class IngestConfig:
             )
             token = credentials.device_token
             tenant_id = credentials.tenant_id
+            device_id = credentials.device_id
+            config_etag = credentials.config_etag or None
 
         return cls(
             endpoint=endpoint,
             device_token=token,
             tenant_id=tenant_id,
+            device_id=device_id,
+            config_etag=config_etag,
             timeout=timeout,
             max_batch_bytes=_int("UMAI_INGEST_MAX_BATCH_BYTES", DEFAULT_MAX_BATCH_BYTES),
             max_attempts=_int("UMAI_INGEST_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS),
@@ -136,10 +147,17 @@ class SessionState:
     def __init__(self, path: Optional[Path] = None):
         self.path = path or self._default_path()
         self._hashes: Dict[str, str] = {}
+        self.last_successful_ingest_at: Optional[str] = None
         self._load()
 
     @staticmethod
     def _default_path() -> Path:
+        override = os.environ.get("UMAI_ADR_STATE_DIR")
+        if override:
+            return Path(override) / "state.json"
+        if os.name == "nt":
+            program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+            return Path(program_data) / "UMAI" / "ADR Collector" / "state" / "state.json"
         cache_home = os.environ.get("XDG_CACHE_HOME")
         base = Path(cache_home) if cache_home else Path.home() / ".cache"
         return base / "adr_sensor" / "state.json"
@@ -151,6 +169,9 @@ class SessionState:
             sent = data.get("sent")
             if isinstance(sent, dict):
                 self._hashes = {str(k): str(v) for k, v in sent.items()}
+            last_ingest = data.get("last_successful_ingest_at")
+            if isinstance(last_ingest, str) and last_ingest:
+                self.last_successful_ingest_at = last_ingest
         except (OSError, ValueError):
             self._hashes = {}
 
@@ -171,7 +192,11 @@ class SessionState:
 
     def save(self) -> None:
         """Write atomically so a crash mid-write cannot corrupt the state."""
-        payload = {"version": 1, "sent": self._hashes}
+        payload = {
+            "version": 2,
+            "sent": self._hashes,
+            "last_successful_ingest_at": self.last_successful_ingest_at,
+        }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
@@ -195,19 +220,11 @@ class IngestClient:
 
     @property
     def url(self) -> str:
-        return f"{self.config.endpoint}/api/v1/sensor/sessions"
+        return f"{self.config.endpoint}/api/v1/adr/sessions"
 
-    def _host_metadata(self) -> Dict[str, Any]:
-        try:
-            hostname = socket.gethostname()
-        except Exception:
-            hostname = "unknown_hostname"
-        username = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown_user"
-        return {
-            "hostname": hostname,
-            "username": username,
-            "platform": sys.platform,
-        }
+    @property
+    def heartbeat_url(self) -> str:
+        return f"{self.config.endpoint}/api/v1/adr/heartbeat"
 
     def _batches(self, sessions: List[AgentEvent]) -> List[List[Dict[str, Any]]]:
         """Group serialized sessions into request-sized chunks.
@@ -244,6 +261,8 @@ class IngestClient:
         }
         if self.config.tenant_id:
             headers["X-Tenant-Id"] = self.config.tenant_id
+        if self.config.device_id:
+            headers["X-Device-Id"] = self.config.device_id
         return headers
 
     def _post(self, body: Dict[str, Any]) -> None:
@@ -260,7 +279,7 @@ class IngestClient:
             )
 
             try:
-                with urllib.request.urlopen(request, timeout=self.config.timeout) as response:
+                with urlopen(request, timeout=self.config.timeout) as response:
                     if 200 <= response.status < 300:
                         return
                     last_error = f"HTTP {response.status}"
@@ -280,6 +299,56 @@ class IngestClient:
 
         raise TransportError(f"{last_error} after {self.config.max_attempts} attempt(s)")
 
+    def _post_heartbeat(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = self._headers()
+        headers.pop("Content-Encoding", None)
+        request = urllib.request.Request(
+            self.heartbeat_url,
+            data=raw,
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=self.config.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise TransportError(f"Heartbeat HTTP {e.code}") from e
+        except (urllib.error.URLError, socket.timeout, OSError) as e:
+            raise TransportError(f"Heartbeat {e.__class__.__name__}: {e}") from e
+
+    def heartbeat(
+        self,
+        *,
+        observed_sources: List[str],
+        pending_sessions: int,
+        last_successful_ingest_at: Optional[str],
+        status: str,
+        status_detail: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not self.config.device_id:
+            raise TransportError("Heartbeat requires an enrolled device_id")
+        body: Dict[str, Any] = {
+            "device_id": self.config.device_id,
+            "collector_version": __version__,
+            "hostname": socket.gethostname(),
+            "os": platform.system(),
+            "os_version": platform.release(),
+            "config_etag": self.config.config_etag,
+            "supported_sources": list(SUPPORTED_SOURCES),
+            "observed_sources": sorted(set(observed_sources)),
+            "last_successful_ingest_at": last_successful_ingest_at,
+            "pending_sessions": max(pending_sessions, 0),
+            "status": status,
+        }
+        if status_detail:
+            body["status_detail"] = status_detail
+        response = self._post_heartbeat(body)
+        returned_etag = response.get("config_etag")
+        if isinstance(returned_etag, str):
+            self.config.config_etag = returned_etag
+        return response
+
     def send(self, sessions: List[AgentEvent]) -> SendResult:
         result = SendResult()
         if not sessions:
@@ -288,7 +357,6 @@ class IngestClient:
         for batch in self._batches(sessions):
             body = {
                 "collector": {"name": "adr-sensor", "version": __version__},
-                "host": self._host_metadata(),
                 "sessions": batch,
             }
             try:
@@ -316,13 +384,34 @@ def ship(sessions: List[AgentEvent], config: Optional[IngestConfig] = None) -> S
     state = SessionState()
     pending, skipped = state.pending(sessions)
 
-    result = IngestClient(config).send(pending)
+    client = IngestClient(config)
+    result = client.send(pending)
     result.sessions_skipped = skipped
 
     # Only record what actually landed. A partial failure re-sends the tail next
     # run; the ingest side dedupes on session id + content hash.
     if result.sessions_sent:
         state.mark_sent(pending[: result.sessions_sent])
-        state.save()
+        state.last_successful_ingest_at = datetime.now(timezone.utc).isoformat()
+
+    state.save()
+
+    pending_count = max(len(pending) - result.sessions_sent, 0)
+    if result.errors and result.sessions_sent:
+        health_status, detail = "degraded", "PARTIAL_INGEST"
+    elif result.errors:
+        health_status, detail = "error", "INGEST_FAILED"
+    else:
+        health_status, detail = "healthy", None
+    try:
+        client.heartbeat(
+            observed_sources=[session.source for session in sessions],
+            pending_sessions=pending_count,
+            last_successful_ingest_at=state.last_successful_ingest_at,
+            status=health_status,
+            status_detail=detail,
+        )
+    except TransportError as e:
+        result.errors.append(str(e))
 
     return result

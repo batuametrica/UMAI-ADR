@@ -121,3 +121,55 @@ class TestEnsureCredentials:
         result = ensure_credentials("https://umai.example.com", store=store)
         assert result.device_token == "fresh-token"
         assert CredentialStore(path=path).load().device_token == "fresh-token"
+
+
+class TestAdrApiMigration:
+    def test_bootstrap_uses_adr_contract_and_collector_fields(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_post(url, *, token, body, timeout, tenant_id):
+            calls.append((url, body))
+            return {
+                "tenant_id": tenant_id,
+                "device_id": body["device_id"],
+                "device_token": "device-token",
+                "expires_at": int(time.time()) + 3600,
+                "collection_mode": "metadata",
+                "config_etag": '"adr-config"',
+            }
+
+        monkeypatch.setattr(enrollment, "_post_json", fake_post)
+        result = enrollment.bootstrap(
+            "https://umai.example.com",
+            bootstrap_token="bootstrap",
+            tenant_id="11111111-1111-1111-1111-111111111111",
+            store=CredentialStore(path=tmp_path / "device.json"),
+        )
+
+        assert calls[0][0].endswith("/api/v1/adr/bootstrap")
+        assert "collector_version" in calls[0][1]
+        assert "agent_version" not in calls[0][1]
+        assert calls[0][1]["supported_sources"]
+        assert result.collection_mode == "metadata"
+
+    def test_renew_uses_adr_contract(self, tmp_path, monkeypatch):
+        urls = []
+
+        def fake_post(url, *, token, body, timeout, tenant_id):
+            urls.append(url)
+            return {
+                "tenant_id": tenant_id,
+                "device_id": "HOST-abc123",
+                "device_token": "fresh-token",
+                "expires_at": int(time.time()) + 3600,
+                "collection_mode": "full_session",
+                "config_etag": '"adr-config"',
+            }
+
+        monkeypatch.setattr(enrollment, "_post_json", fake_post)
+        enrollment.renew(
+            "https://umai.example.com",
+            creds(60),
+            store=CredentialStore(path=tmp_path / "device.json"),
+        )
+        assert urls == ["https://umai.example.com/api/v1/adr/renew"]

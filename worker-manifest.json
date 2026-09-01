@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "artifact": "umai-adr-worker",
+  "version_source": "UMAI_WORKER_IMAGE",
+  "dockerfile": "Dockerfile.worker",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "entrypoint": ["python", "-m", "umai.worker"],
+  "stages": ["triage", "reason"],
+  "operations_port": 9100,
+  "health": "/healthz",
+  "readiness": "/readyz",
+  "metrics": "/metrics"
+}

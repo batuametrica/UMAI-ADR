@@ -9,13 +9,18 @@ Outbound connections only.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
+import os
 import random
+import signal
 import sys
+import threading
 import time
 
 from .client import PlatformClient, PlatformConfig, PlatformError
 from .config import ConfigError, WorkerConfig, load_worker_config
+from .operations import RuntimeState, start_operations_server
 
 logger = logging.getLogger("umai.worker")
 
@@ -117,20 +122,37 @@ def _report_failure(
 
 
 def _run_triage_batch(
-    client: PlatformClient, limit: int, tenant_id: str | None, config: WorkerConfig
+    client: PlatformClient,
+    limit: int,
+    tenant_id: str | None,
+    config: WorkerConfig,
+    stop: threading.Event | None = None,
+    runtime: RuntimeState | None = None,
 ) -> int:
     from .triage import TriageRunner
 
     sessions = client.claim("triage", limit=limit, tenant_id=tenant_id)
+    if runtime:
+        runtime.queue_claim_batch_size = len(sessions)
     if not sessions:
         return 0
+    if runtime:
+        runtime.claimed_total += len(sessions)
+        runtime.active_leases += len(sessions)
+        runtime.queue_age_seconds = _oldest_queue_age(sessions)
 
     stage = config.triage
     runner = TriageRunner(stage=stage)
     processed = 0
     spent = 0.0
 
-    for session in sessions:
+    for index, session in enumerate(sessions):
+        if stop and stop.is_set():
+            released = client.release("triage", sessions[index:])
+            if runtime:
+                runtime.released_total += released
+                runtime.active_leases = max(runtime.active_leases - released, 0)
+            break
         tenant = str(session["tenant_id"])
         key = session["session_key"]
         try:
@@ -140,6 +162,10 @@ def _run_triage_batch(
             spent += _account(config, stage, outcome, key)
             client.submit(outcome.to_result(tenant, key))
             processed += 1
+            if runtime:
+                runtime.processed_total += 1
+                runtime.active_leases = max(runtime.active_leases - 1, 0)
+                runtime.last_success_at = time.time()
             logger.info(
                 "triage session=%s verdict=%s tactic=%s cost=%s",
                 key[:12],
@@ -150,9 +176,13 @@ def _run_triage_batch(
         except PlatformError as e:
             # Leave the lease to expire; the session is reclaimed and retried.
             logger.warning("triage session=%s platform error: %s", key[:12], e)
+            if runtime:
+                runtime.failed_total += 1
         except BudgetExceeded as e:
             _report_failure(client, tenant, key, "triage", stage.model, str(e))
             logger.warning("triage batch stopped: %s", e)
+            if runtime:
+                runtime.failed_total += 1
             break
         except Exception as e:  # noqa: BLE001 - one bad session must not stop the batch
             _report_failure(
@@ -164,6 +194,8 @@ def _run_triage_batch(
                 )
             else:
                 logger.exception("triage session=%s failed: %s", key[:12], e)
+            if runtime:
+                runtime.failed_total += 1
 
     return processed
 
@@ -188,18 +220,35 @@ def _build_reasoning_runner(config: WorkerConfig):
 
 
 def _run_reason_batch(
-    client: PlatformClient, limit: int, tenant_id: str | None, config: WorkerConfig
+    client: PlatformClient,
+    limit: int,
+    tenant_id: str | None,
+    config: WorkerConfig,
+    stop: threading.Event | None = None,
+    runtime: RuntimeState | None = None,
 ) -> int:
     sessions = client.claim("reason", limit=limit, tenant_id=tenant_id)
+    if runtime:
+        runtime.queue_claim_batch_size = len(sessions)
     if not sessions:
         return 0
+    if runtime:
+        runtime.claimed_total += len(sessions)
+        runtime.active_leases += len(sessions)
+        runtime.queue_age_seconds = _oldest_queue_age(sessions)
 
     stage = config.reasoning
     runner = _build_reasoning_runner(config)
     processed = 0
     spent = 0.0
 
-    for session in sessions:
+    for index, session in enumerate(sessions):
+        if stop and stop.is_set():
+            released = client.release("reason", sessions[index:])
+            if runtime:
+                runtime.released_total += released
+                runtime.active_leases = max(runtime.active_leases - released, 0)
+            break
         tenant = str(session["tenant_id"])
         key = session["session_key"]
         try:
@@ -209,6 +258,10 @@ def _run_reason_batch(
             spent += _account(config, stage, outcome, key)
             client.submit(outcome.to_result(tenant, key, session.get("threat_tactic")))
             processed += 1
+            if runtime:
+                runtime.processed_total += 1
+                runtime.active_leases = max(runtime.active_leases - 1, 0)
+                runtime.last_success_at = time.time()
             logger.info(
                 "reason session=%s verdict=%s technique=%s tools=%s cost=%s",
                 key[:12],
@@ -219,9 +272,13 @@ def _run_reason_batch(
             )
         except PlatformError as e:
             logger.warning("reason session=%s platform error: %s", key[:12], e)
+            if runtime:
+                runtime.failed_total += 1
         except BudgetExceeded as e:
             _report_failure(client, tenant, key, "reason", stage.model, str(e))
             logger.warning("reason batch stopped: %s", e)
+            if runtime:
+                runtime.failed_total += 1
             break
         except Exception as e:  # noqa: BLE001
             _report_failure(
@@ -233,11 +290,30 @@ def _run_reason_batch(
                 )
             else:
                 logger.exception("reason session=%s failed: %s", key[:12], e)
+            if runtime:
+                runtime.failed_total += 1
 
     return processed
 
 
 STAGE_RUNNERS = {"triage": _run_triage_batch, "reason": _run_reason_batch}
+
+
+def _oldest_queue_age(sessions: list[dict]) -> float:
+    now = dt.datetime.now(dt.timezone.utc)
+    ages = []
+    for item in sessions:
+        value = item.get("observed_at")
+        if not value:
+            continue
+        try:
+            observed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=dt.timezone.utc)
+            ages.append(max((now - observed).total_seconds(), 0.0))
+        except ValueError:
+            continue
+    return max(ages, default=0.0)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         "--idle-seconds", type=int, default=60, help="Pause when there is no work"
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--metrics-host", default=os.environ.get("UMAI_WORKER_METRICS_HOST", "0.0.0.0"))
+    parser.add_argument("--metrics-port", type=int, default=int(os.environ.get("UMAI_WORKER_METRICS_PORT", "9100")))
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -270,15 +348,35 @@ def main(argv: list[str] | None = None) -> int:
     for line in worker_config.describe():
         logger.info("config %s", line)
 
+    stop = threading.Event()
+    # Readiness stays false until the platform accepts the first claim request.
+    # This keeps a configured-but-disconnected worker out of service discovery.
+    runtime = RuntimeState(stage=args.stage)
+    operations = start_operations_server(runtime, args.metrics_host, args.metrics_port)
+
+    def request_stop(signum, _frame):
+        logger.info("shutdown requested signal=%s; finishing current session", signum)
+        runtime.ready = False
+        stop.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
     total = 0
-    while True:
+    while not stop.is_set():
+        started = time.monotonic()
         try:
             processed = STAGE_RUNNERS[args.stage](
-                client, args.limit, args.tenant_id, worker_config
+                client, args.limit, args.tenant_id, worker_config, stop, runtime
             )
+            runtime.ready = True
         except PlatformError as e:
             logger.warning("claim failed: %s", e)
+            runtime.ready = False
+            runtime.claim_errors_total += 1
             processed = 0
+        finally:
+            runtime.batch_duration_seconds = time.monotonic() - started
 
         total += processed
 
@@ -286,8 +384,11 @@ def main(argv: list[str] | None = None) -> int:
             break
         if processed == 0:
             # Jitter so several workers do not wake together.
-            time.sleep(args.idle_seconds + random.uniform(0, args.idle_seconds * 0.1))
+            stop.wait(args.idle_seconds + random.uniform(0, args.idle_seconds * 0.1))
 
+    runtime.ready = False
+    operations.shutdown()
+    operations.server_close()
     logger.info("worker finished, %s session(s) processed", total)
     return 0
 
