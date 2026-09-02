@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from .enrollment import SUPPORTED_SOURCES
+from .collection_mode import MODE_POSTURE_ONLY, normalize as normalize_mode, redact_for_mode
+from .enrollment import SUPPORTED_SOURCES, CredentialStore
 from .network import urlopen
 from .schemas.agent_event_schema import AgentEvent
 
@@ -70,6 +71,9 @@ class IngestConfig:
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    # Most restrictive by default: a config that failed to load must not be the
+    # reason transcripts leave the machine.
+    collection_mode: str = MODE_POSTURE_ONLY
 
     @classmethod
     def from_env(cls) -> Optional["IngestConfig"]:
@@ -98,6 +102,10 @@ class IngestConfig:
         tenant_id = os.environ.get("UMAI_TENANT_ID", "").strip() or None
         device_id = os.environ.get("UMAI_DEVICE_ID", "").strip() or None
         config_etag = os.environ.get("UMAI_CONFIG_ETAG", "").strip() or None
+        # Only consulted on the hand-pinned-token path below, where there is no
+        # enrolment response to read the tenant's mode from. Anything it cannot
+        # parse resolves to `posture_only`.
+        collection_mode = normalize_mode(os.environ.get("UMAI_COLLECTION_MODE"))
 
         if not token:
             from .enrollment import ensure_credentials
@@ -112,6 +120,7 @@ class IngestConfig:
             tenant_id = credentials.tenant_id
             device_id = credentials.device_id
             config_etag = credentials.config_etag or None
+            collection_mode = normalize_mode(credentials.collection_mode)
 
         return cls(
             endpoint=endpoint,
@@ -119,6 +128,7 @@ class IngestConfig:
             tenant_id=tenant_id,
             device_id=device_id,
             config_etag=config_etag,
+            collection_mode=collection_mode,
             timeout=timeout,
             max_batch_bytes=_int("UMAI_INGEST_MAX_BATCH_BYTES", DEFAULT_MAX_BATCH_BYTES),
             max_attempts=_int("UMAI_INGEST_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS),
@@ -215,8 +225,9 @@ class SessionState:
 class IngestClient:
     """Minimal HTTP client for POSTing session bundles."""
 
-    def __init__(self, config: IngestConfig):
+    def __init__(self, config: IngestConfig, store: Optional[Any] = None):
         self.config = config
+        self._store = store
 
     @property
     def url(self) -> str:
@@ -237,7 +248,9 @@ class IngestClient:
         current_bytes = 0
 
         for session in sessions:
-            payload = session.get_non_null_fields()
+            payload = redact_for_mode(
+                session.get_non_null_fields(), self.config.collection_mode
+            )
             size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
             if current and current_bytes + size > self.config.max_batch_bytes:
@@ -347,7 +360,36 @@ class IngestClient:
         returned_etag = response.get("config_etag")
         if isinstance(returned_etag, str):
             self.config.config_etag = returned_etag
+        self._adopt_collection_mode(response)
         return response
+
+    def _adopt_collection_mode(self, response: Dict[str, Any]) -> None:
+        """Take the mode the server just reported and keep it for the next run.
+
+        Heartbeat runs after the send, so a mode change reaches the collector
+        one run late no matter what — but only if it is written down. Held in
+        memory it would be lost with the process, and a tenant that tightened
+        its mode would keep receiving content from every device until each one
+        happened to renew its token.
+        """
+        mode = response.get("collection_mode")
+        if not isinstance(mode, str):
+            return
+
+        resolved = normalize_mode(mode)
+        if resolved == self.config.collection_mode:
+            return
+
+        self.config.collection_mode = resolved
+        try:
+            store = self._store or CredentialStore()
+            store.update_collection_mode(resolved, self.config.config_etag)
+        except Exception as e:  # noqa: BLE001 - a run must not fail over a cache write
+            # Recoverable: the next heartbeat reports the mode again. Until it
+            # sticks the collector keeps using the previous one and the server
+            # rejects anything the tenant's mode forbids, so the failure is
+            # contained — but it is not silent.
+            print(f"[TRANSPORT] Could not persist collection mode: {e}")
 
     def send(self, sessions: List[AgentEvent]) -> SendResult:
         result = SendResult()

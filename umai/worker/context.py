@@ -33,6 +33,63 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return {}
 
 
+# Tactic -> the operator-facing category from the finding contract
+# (`docs/contracts/finding-and-worker-result-schema.md` §3, closed set).
+#
+# The queue is split by category, so leaving it unset pushes every reasoning
+# finding into `other`, which the platform documents as a defect marker rather
+# than a value. The mapping lives next to the taxonomy because it is a fact
+# about the taxonomy, not about any one detector.
+CATEGORY_BY_TACTIC: dict[str, str] = {
+    "data_exfiltration": "data_exposure",
+    "initial_compromise": "prompt_injection",
+    "permission_abuse": "unsafe_tool_use",
+    "security_control_bypass": "policy_evasion",
+    "reasoning_data_manipulation": "agent_misbehavior",
+    "operational_impact": "agent_misbehavior",
+}
+
+# Techniques whose category is narrower than their tactic's. Credential
+# harvesting sits under data exfiltration, but `credential_exposure` is the
+# category an operator filters on when a key is involved.
+CATEGORY_BY_TECHNIQUE: dict[str, str] = {
+    "UMAI.T0001": "credential_exposure",
+}
+
+
+def _merge_frameworks(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Fold UMAI's tactics into the upstream framework, one tactic at a time.
+
+    Upstream's `threat_repository.yaml` is left byte-identical so the fork keeps
+    merging cleanly; additions live in `umai_threat_overlay.yaml` under their own
+    `UMAI.TXXXX` ids. An overlay tactic that already exists upstream contributes
+    its techniques to that tactic rather than replacing it — a fork should be
+    able to add a technique without inheriting responsibility for the ones
+    upstream ships alongside it.
+    """
+    if not overlay:
+        return base
+
+    merged = dict(base)
+    framework = dict(merged.get("threat_framework") or {})
+    tactics = dict(framework.get("tactics") or {})
+
+    for name, incoming in ((overlay.get("threat_framework") or {}).get("tactics") or {}).items():
+        existing = tactics.get(name)
+        if not existing:
+            tactics[name] = incoming
+            continue
+        combined = dict(existing)
+        combined["techniques"] = list(existing.get("techniques") or []) + list(
+            incoming.get("techniques") or []
+        )
+        tactics[name] = combined
+
+    framework["tactics"] = tactics
+    merged["threat_framework"] = framework
+    return merged
+
+
 class ContextProviders:
     """Threat-model and policy lookups, exposed as callable tools."""
 
@@ -46,7 +103,10 @@ class ContextProviders:
     @property
     def threats(self) -> dict[str, Any]:
         if self._threats is None:
-            self._threats = _load_yaml(self.data_root / "threat_repository.yaml")
+            self._threats = _merge_frameworks(
+                _load_yaml(self.data_root / "threat_repository.yaml"),
+                _load_yaml(self.data_root / "umai_threat_overlay.yaml"),
+            )
         return self._threats
 
     @property
@@ -83,6 +143,56 @@ class ContextProviders:
                 if str(technique.get("id", "")).lower() == technique_id.lower():
                     return {"tactic": tactic_name, **technique}
         return {"error": f"Unknown technique: {technique_id}"}
+
+    def catalog_digest(self) -> str:
+        """Every technique id and name, grouped by tactic, as prompt text.
+
+        The lookup tools stay, but the label space cannot depend on the model
+        choosing to go and find it. Left to the tools, the same session came
+        back with a neighbouring technique on one run and `null` on the next —
+        the classification varied with whether the agent felt like searching.
+        Seventeen id/name pairs cost a few hundred tokens and make the choice
+        a selection from a list instead of a discovery task. `get_technique_details`
+        is still there for the description and detection guidance behind an id.
+        """
+        tactics = (self.threats.get("threat_framework") or {}).get("tactics") or {}
+        lines: list[str] = []
+        for name, body in tactics.items():
+            techniques = body.get("techniques") or []
+            if not techniques:
+                continue
+            lines.append(f"{name}:")
+            for technique in techniques:
+                lines.append(f"  {technique.get('id')}  {technique.get('name')}")
+        return "\n".join(lines)
+
+    def classify_technique(self, technique_id: Optional[str]) -> dict[str, Any]:
+        """Canonical id, name, tactic, severity and category for a technique.
+
+        The model reports a technique id; every other classification field on
+        the finding follows from the catalog rather than from the model, so a
+        renamed technique or a re-parented tactic cannot drift per finding.
+        Returns an empty dict for an unknown or absent id — a technique the
+        catalog does not have must not become a half-populated finding.
+        """
+        if not technique_id:
+            return {}
+
+        details = self.get_technique_details(str(technique_id).strip())
+        if details.get("error"):
+            return {}
+
+        tactic = details.get("tactic")
+        resolved = {
+            "technique_id": details.get("id"),
+            "technique_name": details.get("name"),
+            "tactic": tactic,
+            "category": CATEGORY_BY_TECHNIQUE.get(str(details.get("id")))
+            or CATEGORY_BY_TACTIC.get(str(tactic)),
+        }
+        if details.get("severity"):
+            resolved["severity"] = details["severity"]
+        return {key: value for key, value in resolved.items() if value}
 
     def search_techniques(self, keywords: list[str]) -> dict[str, Any]:
         """Techniques whose name, description, or guidance mentions the keywords."""

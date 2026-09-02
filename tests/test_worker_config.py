@@ -354,3 +354,58 @@ class TestSessionCostAccounting:
         config = _load()
         # $2.50 per 1M input tokens, from the detector config.
         assert _account(config, config.triage, Outcome(), "sess-1") == pytest.approx(2.50)
+
+
+class TestBlankSdkEnvironment:
+    """An empty `OPENAI_BASE_URL` is worse than an absent one.
+
+    Compose renders `OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}` as an empty string
+    rather than omitting the variable. When a stage has no explicit base URL
+    the worker deliberately passes none, and the OpenAI SDK then reads the
+    environment itself — an empty value is not None, so it becomes the base
+    URL and every request dies with `httpx.UnsupportedProtocol`. Both analysis
+    stages were down this way with no configuration visibly wrong.
+    """
+
+    def test_blank_values_are_removed_from_the_environment(self, monkeypatch) -> None:
+        from umai.worker.config import clear_blank_sdk_env
+
+        monkeypatch.setenv("OPENAI_BASE_URL", "")
+        monkeypatch.setenv("OPENAI_API_KEY", "   ")
+
+        clear_blank_sdk_env()
+
+        import os
+
+        assert "OPENAI_BASE_URL" not in os.environ
+        assert "OPENAI_API_KEY" not in os.environ
+
+    def test_real_values_are_left_alone(self, monkeypatch) -> None:
+        from umai.worker.config import clear_blank_sdk_env
+
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://llm.internal.example.com/v1")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+
+        clear_blank_sdk_env()
+
+        import os
+
+        assert os.environ["OPENAI_BASE_URL"] == "https://llm.internal.example.com/v1"
+        assert os.environ["OPENAI_API_KEY"] == "sk-real"
+
+    def test_loading_the_config_clears_them_before_any_client_is_built(
+        self, monkeypatch
+    ) -> None:
+        import os
+
+        monkeypatch.setenv("OPENAI_BASE_URL", "")
+        monkeypatch.setenv("UMAI_TRIAGE_API_KEY", "sk-triage")
+        monkeypatch.setenv("UMAI_REASONING_API_KEY", "sk-reason")
+
+        config = load_worker_config(DETECTOR_CONFIG)
+
+        assert "OPENAI_BASE_URL" not in os.environ
+        # No base URL configured anywhere means the SDK's own default, which is
+        # only reachable once the blank variable is gone.
+        assert config.triage.base_url is None
+        assert config.reasoning.base_url is None

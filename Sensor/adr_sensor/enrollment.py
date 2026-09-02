@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -129,6 +129,24 @@ class CredentialStore:
         # first, so a crash can never expose metadata that points at a missing
         # credential blob.
         os.replace(tmp, self.path)
+
+    def update_collection_mode(self, collection_mode: str, config_etag: Optional[str]) -> None:
+        """Persist a mode change the server reported over heartbeat.
+
+        A no-op when there is nothing enrolled: with no stored credential there
+        is no next run to constrain, and the mode arrives again with the next
+        bootstrap.
+        """
+        current = self.load()
+        if current is None:
+            return
+        self.save(
+            replace(
+                current,
+                collection_mode=collection_mode,
+                config_etag=config_etag or current.config_etag,
+            )
+        )
 
     def device_id(self) -> str:
         """Stable identifier for this machine, minted once and reused."""

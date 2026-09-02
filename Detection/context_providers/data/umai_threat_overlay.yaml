@@ -1,0 +1,73 @@
+# UMAI additions to the ADR threat framework.
+#
+# Kept out of `threat_repository.yaml` on purpose. That file is upstream's
+# (uber/ADR) and this repository is a tracking fork: editing it in place makes
+# every upstream merge a conflict, and reusing upstream's `ADR.TXXXX` numbering
+# risks a future upstream `ADR.T0018` meaning something other than what our
+# historical findings say it means. Customer SIEM rules pivot on technique_id,
+# so a silently re-pointed id is a correctness problem years after the fact.
+#
+# Hence the `UMAI.TXXXX` namespace: a finding is honest about which taxonomy
+# classified it. `context.py` merges this over the upstream framework, so the
+# reasoning agent sees one catalog.
+#
+# Why this tactic had to exist: upstream's five tactics cover attacks *on* the
+# agent (injection, tool shadowing, MCP poisoning, DoS) plus permission abuse.
+# None of them covers the case the product is sold against — an agent reading
+# local credentials and shipping them somewhere. A session doing exactly that
+# was classified `malicious` with `technique_id: null`, which left the most
+# important detection the least classified one in the queue.
+
+threat_framework:
+  tactics:
+    data_exfiltration:
+      description: Adversaries use these techniques to collect sensitive material
+        an agent can reach on the developer's machine or in its tool surface, and
+        move it outside the organisation's control. The agent is the mechanism
+        rather than the target.
+      techniques:
+      - id: UMAI.T0001
+        name: Agent-Mediated Credential Harvesting
+        severity: critical
+        description: An agent is instructed, or induced by injected content, to read
+          credential material reachable from its execution context — cloud credential
+          files, `.env` files, SSH or signing keys, keychains, CI tokens, browser or
+          IDE token stores — and place it into its own context, tool arguments or
+          output. Harvesting is complete once the secret leaves the file it was
+          stored in; whether it is then transmitted determines the blast radius, not
+          whether the technique occurred.
+        detection_guidance:
+        - 'Malicious: File reads of well-known credential paths (~/.aws/credentials,
+          ~/.ssh/id_*, .env, ~/.config/gcloud, ~/.kube/config, ~/.npmrc, ~/.docker/config.json)
+          where the surrounding request is not about credential management.'
+        - 'Malicious: Shell commands that concatenate several secret-bearing files in
+          one invocation, especially `cat`/`type` chains combining a credentials file
+          with an environment file.'
+        - 'Malicious: Tool results carrying values matching provider key formats (AKIA…,
+          sk-…, sk_live_…, ghp_…, PEM private key headers) into the agent transcript.'
+        - 'Benign: A session whose stated task is rotating, provisioning or validating
+          a credential, where the read is scoped to the one credential being managed.'
+      - id: UMAI.T0002
+        name: Agent-Mediated Data Exfiltration
+        severity: critical
+        description: An agent transmits organisational data — harvested credentials,
+          customer records, source code, internal documents — to a destination outside
+          the organisation's control. The transport is ordinary agent capability —
+          an HTTP tool, a shell `curl`/`Invoke-WebRequest`, an MCP server that forwards
+          its input, a commit to an external repository, or an outbound message. What
+          distinguishes it from normal tool use is the pairing of sensitive material
+          with a destination the task never called for.
+        detection_guidance:
+        - 'Malicious: An outbound request whose body is assembled from the contents of
+          files read earlier in the same session, particularly credential or database
+          files.'
+        - 'Malicious: A destination host that appears for the first time in the session
+          and is unrelated to the stated task, receiving a POST/PUT with a large or
+          secret-bearing body.'
+        - 'Malicious: Piping a fetched remote script straight into a shell (`curl … | bash`,
+          `iwr … | iex`) after credential access — the exfiltration and the follow-on
+          implant usually arrive together.'
+        - 'Malicious: Data leaving through a channel the task did not require: an MCP
+          server, a paste service, a webhook, or a repository outside the organisation.'
+        - 'Benign: Uploads to the destination the task explicitly names, carrying only
+          the artefact the task is about.'

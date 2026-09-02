@@ -18,6 +18,13 @@ COPY umai ./umai
 COPY Detection/config_detector.yaml ./Detection/config_detector.yaml
 COPY Detection/openai_config.py ./Detection/openai_config.py
 COPY Detection/guardrail ./Detection/guardrail
+# The reasoning stage's context providers read the threat framework and the
+# policy store from here. Without them `_load_yaml` returns `{}` and every
+# lookup tool answers "nothing found" — the agent then reports no technique and
+# no policy match for every session it examines, which reaches the operator as
+# a finding with `technique_id: null` and `category: other`. The failure is
+# silent by construction: the tools work, they are just empty.
+COPY Detection/context_providers/data ./Detection/context_providers/data
 RUN chown -R umai:umai /app
 USER umai
 

@@ -104,6 +104,31 @@ def _env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+# Variables the OpenAI SDK reads on its own when the caller does not pass the
+# matching argument. An empty one is worse than an absent one.
+_SDK_FALLBACK_ENV = ("OPENAI_BASE_URL", "OPENAI_API_KEY")
+
+
+def clear_blank_sdk_env() -> None:
+    """Unset OpenAI SDK variables that are present but empty.
+
+    Compose renders `OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}` into an empty
+    string rather than leaving the variable out, and the SDK treats a defined
+    empty `OPENAI_BASE_URL` as a configured endpoint — every request then
+    fails with `httpx.UnsupportedProtocol: Request URL is missing an
+    'http://' or 'https://' protocol`. This module already normalises empty to
+    `None` for its own reads, but that is not enough: when a stage has no
+    explicit base URL we deliberately pass no `base_url` at all, and the SDK
+    reaches around us into the environment.
+
+    Deleting the blank variable is the only fix that holds for a customer's
+    own compose file as well as ours.
+    """
+    for name in _SDK_FALLBACK_ENV:
+        if name in os.environ and not os.environ[name].strip():
+            del os.environ[name]
+
+
 def _float(name: str, default: float, *, minimum: float | None = 0.0) -> float:
     raw = _env(name)
     if not raw:
@@ -226,6 +251,10 @@ def load_worker_config(detector_config: Optional[dict[str, Any]] = None) -> Work
 
     Raises ConfigError with a message aimed at whoever has to fix it.
     """
+    # Before anything reads the environment, and well before the first client
+    # is built.
+    clear_blank_sdk_env()
+
     if detector_config is None:
         from .triage import load_detector_config  # noqa: PLC0415 - avoids a cycle
 

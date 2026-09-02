@@ -1,6 +1,7 @@
 """Tests for the reasoning stage and its context providers."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -26,11 +27,17 @@ class TestContextProviders:
     def test_the_full_framework_lists_every_tactic(self, providers):
         framework = providers.get_threat_framework()
         assert set(framework["tactics"]) == {
+            # Upstream's five.
             "initial_compromise",
             "permission_abuse",
             "security_control_bypass",
             "reasoning_data_manipulation",
             "operational_impact",
+            # UMAI's, from `umai_threat_overlay.yaml`. Upstream's taxonomy
+            # covers attacks on the agent; nothing in it covers an agent
+            # collecting local credentials and shipping them out, which left
+            # the product's headline detection with no technique to name.
+            "data_exfiltration",
         }
 
     def test_a_tactic_returns_its_techniques(self, providers):
@@ -251,3 +258,186 @@ class TestUserMessage:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# --------------------------------------------------------------------------
+# Technique resolution (UMA-40 / UMA-51)
+# --------------------------------------------------------------------------
+
+
+class TestTechniqueClassification:
+    """Every classification field but the id comes from the catalog.
+
+    The model reports a technique id and nothing else. Name, tactic, category
+    and severity are looked up, so a finding cannot carry a technique name the
+    catalog disagrees with, and a re-parented technique corrects every future
+    finding at once.
+    """
+
+    def test_umai_techniques_resolve_with_their_category(self, providers) -> None:
+        resolved = providers.classify_technique("UMAI.T0001")
+
+        assert resolved["technique_name"] == "Agent-Mediated Credential Harvesting"
+        assert resolved["tactic"] == "data_exfiltration"
+        # Narrower than the tactic's own category: an operator filtering for
+        # leaked keys wants this one.
+        assert resolved["category"] == "credential_exposure"
+        assert resolved["severity"] == "critical"
+
+    def test_upstream_techniques_still_resolve(self, providers) -> None:
+        resolved = providers.classify_technique("ADR.T0007")
+
+        assert resolved["technique_name"] == "Exploitation of Excessive Tool Permissions"
+        assert resolved["tactic"] == "permission_abuse"
+        assert resolved["category"] == "unsafe_tool_use"
+
+    def test_an_unknown_id_resolves_to_nothing(self, providers) -> None:
+        # Better an unclassified finding than one classified from a
+        # hallucinated id.
+        assert providers.classify_technique("ADR.T9999") == {}
+        assert providers.classify_technique(None) == {}
+
+    def test_the_upstream_file_is_not_edited_by_the_overlay(self, providers) -> None:
+        """The overlay adds a tactic without touching upstream's five."""
+        tactics = (providers.threats["threat_framework"]["tactics"]).keys()
+
+        assert "data_exfiltration" in tactics
+        assert {
+            "initial_compromise",
+            "permission_abuse",
+            "security_control_bypass",
+            "reasoning_data_manipulation",
+            "operational_impact",
+        } <= set(tactics)
+
+    def test_exfiltration_behaviour_is_findable_by_search(self, providers) -> None:
+        """The reasoning agent finds techniques by searching, not by listing."""
+        found = [m["id"] for m in providers.search_techniques(["credential harvesting"])["matches"]]
+
+        assert "UMAI.T0001" in found
+
+
+class TestResultPayload:
+    def test_a_resolved_technique_overrides_the_triage_tactic(self) -> None:
+        from umai.worker.reasoning import ReasoningOutcome
+
+        outcome = ReasoningOutcome(
+            verdict="malicious",
+            technique_id="UMAI.T0001",
+            confidence=0.9,
+            explanation="Read ~/.aws/credentials and posted it to an unrelated host",
+            model="gpt-4o",
+            technique_name="Agent-Mediated Credential Harvesting",
+            tactic="data_exfiltration",
+            category="credential_exposure",
+            severity="critical",
+        )
+
+        payload = outcome.to_result("t", "s", threat_tactic="permission_abuse")
+
+        # Triage can only name one of five tactics from its prompt; when
+        # reasoning identified a technique, that technique's tactic is the
+        # truthful one.
+        assert payload["threat_tactic"] == "data_exfiltration"
+        assert payload["technique_id"] == "UMAI.T0001"
+        assert payload["technique_name"] == "Agent-Mediated Credential Harvesting"
+        assert payload["category"] == "credential_exposure"
+        assert payload["severity"] == "critical"
+
+    def test_without_a_technique_the_triage_tactic_stands_and_nothing_is_invented(
+        self,
+    ) -> None:
+        from umai.worker.reasoning import ReasoningOutcome
+
+        outcome = ReasoningOutcome(
+            verdict="malicious",
+            technique_id=None,
+            confidence=0.8,
+            explanation="Nothing in the catalog fits",
+            model="gpt-4o",
+        )
+
+        payload = outcome.to_result("t", "s", threat_tactic="permission_abuse")
+
+        assert payload["threat_tactic"] == "permission_abuse"
+        assert payload["technique_id"] is None
+        # Omitted, not guessed: the platform derives these when the detector
+        # does not supply them.
+        assert "category" not in payload
+        assert "severity" not in payload
+
+
+class TestTheImageShipsTheCatalog:
+    """Every data file the context providers read must be in the worker image.
+
+    `Dockerfile.worker` copied `Detection/guardrail` and the detector config but
+    not `Detection/context_providers/data`, so in the built image the threat
+    framework and the policy store were both empty files-that-do-not-exist.
+    `_load_yaml` swallows the `OSError` and returns `{}`, so the lookup tools
+    kept working and kept answering "nothing found": the reasoning agent spent
+    its tool calls searching an empty catalog and reported no technique for
+    every session. Nothing in a unit test can see that, because the data is
+    right there on the developer's disk.
+    """
+
+    DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile.worker"
+
+    def test_the_data_directory_is_copied(self) -> None:
+        body = self.DOCKERFILE.read_text(encoding="utf-8")
+
+        assert "COPY Detection/context_providers/data" in body
+
+    def test_the_files_the_provider_reads_exist_under_that_directory(self) -> None:
+        from umai.worker.context import DATA_ROOT
+
+        # Named here so that adding a third data file to `context.py` without
+        # shipping it fails a test rather than emptying a tool in production.
+        for name in ("threat_repository.yaml", "umai_threat_overlay.yaml", "policy_store.yaml"):
+            assert (DATA_ROOT / name).is_file(), name
+
+    def test_an_absent_catalog_would_produce_the_symptom_we_saw(self, tmp_path) -> None:
+        """Pin the failure mode, so it is recognisable if it ever returns."""
+        empty = ContextProviders(data_root=tmp_path)
+
+        assert empty.get_threat_framework() == {"tactics": {}}
+        assert empty.search_techniques(["credential harvesting"])["matches"] == []
+        assert empty.classify_technique("UMAI.T0001") == {}
+
+
+class TestTheCatalogIsInThePrompt:
+    """Classification must not depend on the agent choosing to search.
+
+    With the catalog reachable only through tools, the same session came back
+    as `ADR.T0007` on one run and `null` on the next — the operator's
+    classification varied with whether the model felt like calling a tool. The
+    ids are a closed list; putting them in the prompt turns discovery into
+    selection.
+    """
+
+    def test_every_technique_id_reaches_the_model(self, providers) -> None:
+        client = FakeClient([FakeMessage(content='{"is_threat": false}')])
+        ReasoningRunner(client, model="m", providers=providers).run(session_fixture())
+
+        system = client.requests[0]["messages"][0]["content"]
+
+        for technique_id in ("ADR.T0007", "ADR.T0012", "UMAI.T0001", "UMAI.T0002"):
+            assert technique_id in system, technique_id
+        assert "data_exfiltration" in system
+
+    def test_a_deployment_without_a_catalog_falls_back_to_the_bare_prompt(
+        self, tmp_path
+    ) -> None:
+        from umai.worker.reasoning import SYSTEM_PROMPT
+
+        client = FakeClient([FakeMessage(content='{"is_threat": false}')])
+        runner = ReasoningRunner(client, model="m", providers=ContextProviders(data_root=tmp_path))
+        runner.run(session_fixture())
+
+        # Better a prompt with no list than one advertising an empty list.
+        assert client.requests[0]["messages"][0]["content"] == SYSTEM_PROMPT
+
+    def test_the_digest_groups_techniques_under_their_tactic(self, providers) -> None:
+        digest = providers.catalog_digest()
+
+        assert "data_exfiltration:" in digest
+        assert "  UMAI.T0001  Agent-Mediated Credential Harvesting" in digest

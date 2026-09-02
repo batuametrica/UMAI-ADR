@@ -26,6 +26,30 @@ if TYPE_CHECKING:  # pragma: no cover
 
 DETECTION_ROOT = Path(__file__).resolve().parents[2] / "Detection"
 
+# Upstream's `TriageLLM.analyze` catches every exception and returns a
+# synthetic `is_suspicious=True, confidence=0.9` result tagged with this
+# `analysis_method`, on a "high recall: escalate on error" argument
+# (`Detection/guardrail/adr_agent/adr_baseline.py`). That argument holds for a
+# benchmark run and fails for a product: a provider outage then produces a
+# fleet-wide wave of high-confidence "suspicious" verdicts that are not
+# detections, and escalates every one of them to the expensive reasoning
+# stage. The session was never examined, so the only honest result is the
+# `error` verdict the worker contract defines for exactly this case.
+#
+# `test_triage.py::test_upstream_still_marks_errors_with_known_method` pins
+# this literal against the vendored upstream, so a rename fails a test instead
+# of silently restoring the fabricated verdicts.
+UPSTREAM_ERROR_METHOD = "Fast Triage (Error)"
+
+
+class TriageUnavailable(RuntimeError):
+    """Triage could not be performed, so no verdict exists for this session.
+
+    Raised in place of upstream's fail-open result. The batch loop reports it
+    as `verdict: error`, which the platform records as `analysis_failed` with
+    the reason attached — an unexamined session stays visibly unexamined.
+    """
+
 
 def _ensure_detection_importable() -> None:
     """Put upstream `Detection/` on the path.
@@ -150,6 +174,11 @@ class TriageRunner:
             )
 
         result = self._triage.analyze(messages)
+
+        if getattr(result, "analysis_method", None) == UPSTREAM_ERROR_METHOD:
+            raise TriageUnavailable(
+                getattr(result, "reason", None) or "Triage failed without a reason"
+            )
 
         tactic = getattr(result, "threat_tactic", None)
         if tactic in ("N/A", "", None):

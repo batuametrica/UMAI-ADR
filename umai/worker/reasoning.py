@@ -50,8 +50,10 @@ security policies, each stating how an AI request could violate it
 Workflow:
 1. Identify what the session actually did: the user's request, the tools called, \
 and what those calls returned.
-2. Look up the suspected tactic in the threat framework, and search for \
-techniques matching the behaviour you observed.
+2. Search the framework for the behaviour you observed, by keyword, before \
+looking up the tactic triage suggested. Triage chooses from a short fixed list \
+and routinely lands on a neighbouring tactic; the technique that names what \
+actually happened is the one to report, whatever tactic it belongs to.
 3. Where the behaviour touches policy, search the policy store and say which \
 control applies.
 4. Weigh the session's configuration — permission mode, connected MCP servers — \
@@ -78,8 +80,14 @@ A permissive configuration is not by itself malicious. Developers routinely \
 disable approval prompts; say so plainly rather than escalating it.
 
 Output format for your final message:
-{"is_threat": true|false, "confidence": 0.0-1.0, "technique_id": "ADR.TXXXX" or \
-null, "explanation": "one paragraph citing what you observed"}
+{"is_threat": true|false, "confidence": 0.0-1.0, "technique_id": id or null, \
+"explanation": "one paragraph citing what you observed"}
+
+`technique_id` must be an id the catalog actually returned — copy it exactly, \
+including its prefix. Before answering with null on a threat, search the \
+catalog for the behaviour you observed: a malicious verdict with no technique \
+reaches the operator unclassified. Use null only when nothing in the catalog \
+fits, and say so in the explanation.
 Start that final reply with the character { immediately."""
 
 REFUSAL_MARKERS = (
@@ -102,6 +110,11 @@ class ReasoningOutcome:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: Optional[float] = None
+    # Resolved from the threat catalog, never from the model's free text.
+    technique_name: Optional[str] = None
+    tactic: Optional[str] = None
+    category: Optional[str] = None
+    severity: Optional[str] = None
 
     def to_result(self, tenant_id: str, session_key: str, threat_tactic: Optional[str]) -> dict[str, Any]:
         """Shape the outcome for `POST /internal/analysis/result`.
@@ -112,14 +125,21 @@ class ReasoningOutcome:
         columns empty, so QRadar rules could not pivot on ADR.TXXXX and
         grouping by tactic was wrong. The platform now types both
         (UMA-40 contract, UMA-44 migration).
+
+        `threat_tactic` is triage's routing guess. When reasoning resolved a
+        technique, that technique's own tactic replaces it: triage picks from a
+        fixed five-item list in its prompt and cannot name a tactic outside it,
+        so keeping its guess next to a technique from another tactic would
+        publish a finding that contradicts itself.
         """
-        return {
+        payload = {
             "tenant_id": tenant_id,
             "session_key": session_key,
             "stage": "reason",
             "verdict": self.verdict,
             "technique_id": self.technique_id,
-            "threat_tactic": threat_tactic,
+            "technique_name": self.technique_name,
+            "threat_tactic": self.tactic or threat_tactic,
             "confidence": self.confidence,
             "reason": self.explanation,
             "model": self.model,
@@ -127,6 +147,13 @@ class ReasoningOutcome:
             "output_tokens": self.output_tokens,
             "cost_usd": self.cost_usd,
         }
+        # Absent beats guessed: the platform derives what the detector does not
+        # supply, and an omitted key is how it knows to.
+        if self.category:
+            payload["category"] = self.category
+        if self.severity:
+            payload["severity"] = self.severity
+        return payload
 
 
 def _extract_json(text: str) -> Optional[dict[str, Any]]:
@@ -156,7 +183,15 @@ def _extract_json(text: str) -> Optional[dict[str, Any]]:
 def _build_user_message(session: dict[str, Any], triage_tactic: Optional[str]) -> str:
     parts = []
     if triage_tactic:
-        parts.append(f"Triage escalated this session under tactic: {triage_tactic}")
+        # Named as a starting point, not an answer. Triage picks from five
+        # tactics hardcoded in its own prompt and cannot report one outside
+        # them, so presenting its guess as the tactic anchors this stage onto a
+        # neighbouring technique when the catalog holds an exact one.
+        parts.append(
+            f"Triage escalated this session under tactic: {triage_tactic}. "
+            "That is a routing hint from a five-tactic list, not a conclusion — "
+            "the catalog has tactics triage cannot name."
+        )
 
     preamble = posture_preamble(session)
     if preamble:
@@ -199,9 +234,27 @@ class ReasoningRunner:
         self.use_tools = use_tools
         self.cost_rates = cost_rates
 
+    def _system_prompt(self) -> str:
+        """The prompt with the technique catalog appended.
+
+        Built per run rather than baked into the constant so a catalog change
+        — a new technique, a re-parented tactic — reaches the model without a
+        code change, and so a deployment with no catalog degrades to the bare
+        prompt instead of advertising an empty list.
+        """
+        digest = self.providers.catalog_digest()
+        if not digest:
+            return SYSTEM_PROMPT
+        return (
+            f"{SYSTEM_PROMPT}\n\n"
+            "Technique catalog — `technique_id` must be one of these ids, "
+            "copied exactly, or null:\n"
+            f"{digest}"
+        )
+
     def run(self, session: dict[str, Any], triage_tactic: Optional[str] = None) -> ReasoningOutcome:
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": _build_user_message(session, triage_tactic)},
         ]
 
@@ -313,9 +366,11 @@ class ReasoningRunner:
         except (TypeError, ValueError):
             confidence = None
 
+        resolved = self.providers.classify_technique(parsed.get("technique_id"))
+
         return ReasoningOutcome(
             verdict="malicious" if is_threat else "benign",
-            technique_id=parsed.get("technique_id") or None,
+            technique_id=resolved.get("technique_id") or parsed.get("technique_id") or None,
             confidence=confidence,
             explanation=parsed.get("explanation"),
             model=self.model,
@@ -323,4 +378,8 @@ class ReasoningRunner:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=cost,
+            technique_name=resolved.get("technique_name"),
+            tactic=resolved.get("tactic"),
+            category=resolved.get("category"),
+            severity=resolved.get("severity"),
         )
