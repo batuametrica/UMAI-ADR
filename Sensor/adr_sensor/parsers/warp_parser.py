@@ -8,6 +8,7 @@ Supports macOS path. Linux support can be added when Warp provides Linux paths.
 import json
 import sqlite3
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,7 +20,11 @@ from .base_parser import BaseParser
 class WarpParser(BaseParser):
     """Parser for Warp Terminal SQLite database."""
 
-    def __init__(self):
+    def __init__(self, max_age_days: Optional[int] = None):
+        super().__init__(max_age_days)
+        # UMAI: macOS only. Windows (and Linux) are unsupported/unverified —
+        # Warp's Windows data path has not been confirmed, so support is
+        # deferred (go-live decision D5). On Windows this path never exists.
         self.base_path = Path.home() / "Library/Application Support/dev.warp.Warp-Stable"
         self.db_path = self.base_path / "warp.sqlite"
 
@@ -42,7 +47,10 @@ class WarpParser(BaseParser):
             conversations = self._get_all_conversations(conn)
             print(f"[WARP] Found {len(conversations)} conversations")
 
-            for conversation in conversations:
+            recent = [c for c in conversations if self._is_recent(self._last_modified(c))]
+            self._report_skipped("WARP", len(conversations) - len(recent), "conversations")
+
+            for conversation in recent:
                 conversation_id = conversation["conversation_id"]
                 try:
                     exchanges = self._get_conversation_exchanges(conn, conversation_id)
@@ -59,6 +67,17 @@ class WarpParser(BaseParser):
             traceback.print_exc()
 
         return entries
+
+    @staticmethod
+    def _last_modified(conversation: Dict) -> Optional[datetime]:
+        """`last_modified_at` as UTC, or None when absent or unparseable."""
+        value = conversation.get("last_modified_at")
+        if value is None or value == "":
+            return None
+        try:
+            return normalize_timestamp(value)
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
 
     def _get_all_conversations(self, conn) -> List[Dict]:
         """Get all conversations from the database."""

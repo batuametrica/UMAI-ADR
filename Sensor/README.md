@@ -12,12 +12,18 @@ ADR Sensor is a Python library that collects telemetry from AI coding agents to 
 
 | Agent                         | Log Format                    | Platform     |
 | ----------------------------- | ----------------------------- | ------------ |
-| **Claude Code**               | JSONL (`~/.claude/projects/`) | macOS, Linux |
-| **Cursor IDE**                | SQLite (`state.vscdb`)        | macOS, Linux |
-| **Cline (Claude Dev)**        | JSON task files               | macOS, Linux |
-| **Claude Desktop Agent Mode** | JSONL audit logs              | macOS        |
-| **OpenAI Codex CLI**          | JSONL (`~/.codex/sessions/`)  | macOS, Linux |
-| **Warp Terminal**             | SQLite (`warp.sqlite`)        | macOS        |
+| **Claude Code**               | JSONL (`~/.claude/projects/`) | Windows, macOS, Linux |
+| **Cursor IDE**                | SQLite (`state.vscdb`)        | Windows, macOS, Linux |
+| **Cline (Claude Dev)**        | JSON task files               | Windows, macOS, Linux |
+| **Claude Desktop Agent Mode** | JSONL audit logs / sidecars   | Windows, macOS |
+| **OpenAI Codex CLI**          | JSONL (`$CODEX_HOME/sessions`, else `~/.codex/sessions/`) | Windows, macOS, Linux |
+| **Warp Terminal**             | SQLite (`warp.sqlite`)        | macOS (Windows deferred) |
+
+UMAI: Cursor and Cline resolve from the VS Code-family user-data root —
+`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config`
+on Linux — via `adr_sensor/platform_paths.py`. Cline is scanned in every host
+it can be installed in: Cursor, VS Code, VS Code Insiders, VSCodium and
+Windsurf.
 
 
 ## Architecture

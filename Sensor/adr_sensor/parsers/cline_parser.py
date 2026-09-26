@@ -2,7 +2,8 @@
 Parser for Cline (Claude Dev) logs.
 Reads JSON files from the Cline extension's task directories.
 
-Supports both macOS and Linux paths.
+Scans every VS Code-family host (Cursor, VS Code, Insiders, VSCodium,
+Windsurf) on Windows, macOS and Linux via platform_paths.
 """
 
 import json
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .. import platform_paths
 from ..schemas.agent_event_schema import AgentEvent, ChatMessage, ToolUsage
 from ..utils.timestamp_utils import normalize_timestamp
 from .base_parser import BaseParser
@@ -19,31 +21,49 @@ from .base_parser import BaseParser
 class ClineParser(BaseParser):
     """Parser for Cline (Claude Dev) logs."""
 
-    def __init__(self):
-        # Support macOS and Linux paths
-        macos_path = (
-            Path.home()
-            / "Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/tasks"
+    def __init__(self, max_age_days: Optional[int] = None, base_path: Optional[str] = None):
+        super().__init__(max_age_days)
+        # UMAI: upstream only looked inside Cursor's globalStorage on macOS or
+        # Linux. Cline installs into any VS Code-family host, so every host's
+        # task store is scanned. An explicit base_path still wins.
+        self.base_paths: List[Path] = (
+            [Path(base_path)] if base_path else platform_paths.cline_task_roots()
         )
-        linux_path = (
-            Path.home() / ".config/Cursor/User/globalStorage/saoudrizwan.claude-dev/tasks"
-        )
-        self.base_path = macos_path if macos_path.exists() else linux_path
+
+    @property
+    def base_path(self) -> Optional[Path]:
+        """First task root (single-root compatibility for upstream callers)."""
+        return self.base_paths[0] if self.base_paths else None
+
+    @base_path.setter
+    def base_path(self, value) -> None:
+        self.base_paths = [Path(value)] if value else []
 
     def parse_all(self) -> List[AgentEvent]:
         """Parse all available Cline logs."""
         entries = []
 
-        if not self.base_path.exists():
-            print(f"[CLINE] No logs found at {self.base_path}")
+        roots = [root for root in self.base_paths if root.exists()]
+        if not roots:
+            where = ", ".join(str(p) for p in self.base_paths) or "any VS Code-family profile"
+            print(f"[CLINE] No logs found at {where}")
             return entries
 
-        print(f"[CLINE] Scanning for logs in {self.base_path}")
-
-        task_dirs = [d for d in self.base_path.iterdir() if d.is_dir()]
+        task_dirs: List[Path] = []
+        for root in roots:
+            print(f"[CLINE] Scanning for logs in {root}")
+            task_dirs.extend(d for d in root.iterdir() if d.is_dir())
         print(f"[CLINE] Found {len(task_dirs)} task directories")
 
+        # UMAI: age by the conversation file's mtime — the same value
+        # parse_cline_log reports as the session timestamp. A task without the
+        # file is left to parse_cline_log, which ignores it.
+        skipped_count = 0
         for task_dir in task_dirs:
+            api_file = task_dir / "api_conversation_history.json"
+            if api_file.exists() and not self._is_recent_mtime(api_file):
+                skipped_count += 1
+                continue
             try:
                 entry = self.parse_cline_log(task_dir)
                 if entry:
@@ -51,6 +71,7 @@ class ClineParser(BaseParser):
             except Exception as e:
                 print(f"[CLINE] Error parsing task {task_dir}: {e}")
 
+        self._report_skipped("CLINE", skipped_count, "tasks")
         return entries
 
     def parse_cline_log(self, task_dir: Path) -> Optional[AgentEvent]:

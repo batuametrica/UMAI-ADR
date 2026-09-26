@@ -9,10 +9,11 @@ Performance-optimized: Skips log files older than 2 weeks by default.
 """
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .. import platform_paths
 from ..schemas.agent_event_schema import AgentEvent, ChatMessage, ToolUsage
 from ..utils.string_utils import truncate_middle
 from ..utils.timestamp_utils import normalize_timestamp
@@ -24,9 +25,15 @@ MAX_LOG_AGE_DAYS = 14
 class ClaudeParser(BaseParser):
     """Parser for Claude Code JSONL log files."""
 
-    def __init__(self, max_age_days: int = MAX_LOG_AGE_DAYS):
-        self.base_path = Path.home() / ".claude/projects"
-        self.max_age_days = max_age_days
+    DEFAULT_MAX_AGE_DAYS = MAX_LOG_AGE_DAYS
+
+    def __init__(self, max_age_days: Optional[int] = None, base_path: Optional[str] = None):
+        super().__init__(max_age_days)
+        if base_path:
+            self.base_path = Path(base_path)
+        else:
+            found = platform_paths.claude_code_projects()
+            self.base_path = found[0] if found else Path.home() / ".claude/projects"
 
     def parse_all(self) -> List[AgentEvent]:
         """Parse all available Claude Code logs."""
@@ -39,22 +46,16 @@ class ClaudeParser(BaseParser):
         jsonl_files = list(self.base_path.glob("**/*.jsonl"))
         print(f"[CLAUDE] Found {len(jsonl_files)} JSONL files")
 
-        cutoff_time = datetime.now(timezone.utc) - timedelta(days=self.max_age_days)
         filtered_files = []
         skipped_count = 0
 
         for jsonl_file in jsonl_files:
-            try:
-                mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime, tz=timezone.utc)
-                if mtime >= cutoff_time:
-                    filtered_files.append(jsonl_file)
-                else:
-                    skipped_count += 1
-            except (OSError, PermissionError):
+            if self._is_recent_mtime(jsonl_file):
+                filtered_files.append(jsonl_file)
+            else:
                 skipped_count += 1
 
-        if skipped_count > 0:
-            print(f"[CLAUDE] Skipped {skipped_count} files older than {self.max_age_days} days")
+        self._report_skipped("CLAUDE", skipped_count, "files")
 
         print(f"[CLAUDE] Processing {len(filtered_files)} recent files")
 

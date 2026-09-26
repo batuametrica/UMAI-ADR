@@ -155,6 +155,11 @@ Examples:
                     f"{send_result.batches_sent} batch(es); "
                     f"{send_result.sessions_skipped} unchanged since last run"
                 )
+                if send_result.sessions_deferred:
+                    print(
+                        f"  {send_result.sessions_deferred} session(s) deferred by "
+                        "UMAI_INGEST_MAX_SESSIONS_PER_RUN; they ship on later runs"
+                    )
                 for error in send_result.errors:
                     success = False
                     print(f"  Ingest error: {error}")

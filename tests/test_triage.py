@@ -145,3 +145,36 @@ def test_upstream_still_marks_errors_with_known_method():
 
     assert result.analysis_method == UPSTREAM_ERROR_METHOD
     assert result.is_suspicious is True  # the fail-open this module exists to catch
+
+
+def test_cost_uses_the_configured_stage_rates_not_the_yaml():
+    """The budget is validated against StageConfig rates, so triage must price
+    with them too — upstream's get_triage_rates() would ignore an env override."""
+    from umai.worker.config import StageConfig
+
+    runner = _runner_with(
+        SimpleNamespace(
+            is_suspicious=False,
+            confidence=0.2,
+            reason="nothing here",
+            threat_tactic="N/A",
+            analysis_method="Fast Triage",
+            input_tokens=1_000_000,
+            output_tokens=100_000,
+        )
+    )
+    runner._config = SimpleNamespace(get_triage_rates=lambda: (99.0, 99.0))
+    runner._calculate_cost = lambda *args, **kwargs: 999.0
+    runner._stage = StageConfig(
+        stage="triage",
+        model="gpt-4o",
+        base_url=None,
+        api_key="k",
+        timeout_s=60,
+        cost_per_1m_input=0.10,
+        cost_per_1m_output=0.40,
+    )
+
+    outcome = runner.run(SESSION)
+
+    assert outcome.cost_usd == pytest.approx(0.10 + 0.04)

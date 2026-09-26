@@ -60,6 +60,11 @@ ENV_VARS = [
     "UMAI_REASONING_TOOLS",
     "UMAI_MAX_COST_PER_SESSION_USD",
     "UMAI_MAX_COST_PER_BATCH_USD",
+    "UMAI_MAX_COST_PER_DAY_USD",
+    "UMAI_TRIAGE_COST_PER_1M_INPUT",
+    "UMAI_TRIAGE_COST_PER_1M_OUTPUT",
+    "UMAI_REASONING_COST_PER_1M_INPUT",
+    "UMAI_REASONING_COST_PER_1M_OUTPUT",
 ]
 
 
@@ -215,6 +220,156 @@ class TestBudget:
     def test_a_negative_cap_is_refused(self) -> None:
         with pytest.raises(ConfigError):
             _load(UMAI_MAX_COST_PER_SESSION_USD="-1")
+
+
+class TestDailyBudget:
+    def test_the_daily_cap_is_read_and_enforced(self) -> None:
+        budget = _load(UMAI_MAX_COST_PER_DAY_USD="20").budget
+        assert budget.max_cost_per_day_usd == 20.0
+        assert budget.enforced is True
+
+    def test_it_is_off_by_default(self) -> None:
+        assert _load().budget.max_cost_per_day_usd == 0.0
+
+    @pytest.mark.parametrize(
+        "other", ["UMAI_MAX_COST_PER_SESSION_USD", "UMAI_MAX_COST_PER_BATCH_USD"]
+    )
+    def test_a_daily_cap_below_a_smaller_cap_is_refused(self, other: str) -> None:
+        with pytest.raises(ConfigError) as exc:
+            _load(UMAI_MAX_COST_PER_DAY_USD="1", **{other: "5"})
+        assert "UMAI_MAX_COST_PER_DAY_USD is below" in str(exc.value)
+
+    def test_all_three_caps_can_be_combined(self) -> None:
+        budget = _load(
+            UMAI_MAX_COST_PER_SESSION_USD="0.25",
+            UMAI_MAX_COST_PER_BATCH_USD="5",
+            UMAI_MAX_COST_PER_DAY_USD="50",
+        ).budget
+        assert (
+            budget.max_cost_per_session_usd,
+            budget.max_cost_per_batch_usd,
+            budget.max_cost_per_day_usd,
+        ) == (0.25, 5.0, 50.0)
+
+    def test_a_negative_daily_cap_is_refused(self) -> None:
+        with pytest.raises(ConfigError):
+            _load(UMAI_MAX_COST_PER_DAY_USD="-1")
+
+    def test_the_daily_cap_is_in_the_startup_lines(self) -> None:
+        assert "day=$50.0000" in _load(UMAI_MAX_COST_PER_DAY_USD="50").describe()[-1]
+
+
+class TestRateOverrides:
+    def test_env_rates_override_the_detector_config(self) -> None:
+        config = _load(
+            UMAI_TRIAGE_COST_PER_1M_INPUT="0.10",
+            UMAI_TRIAGE_COST_PER_1M_OUTPUT="0.40",
+            UMAI_REASONING_COST_PER_1M_INPUT="1.25",
+            UMAI_REASONING_COST_PER_1M_OUTPUT="10",
+        )
+        assert (config.triage.cost_per_1m_input, config.triage.cost_per_1m_output) == (
+            0.10,
+            0.40,
+        )
+        assert (
+            config.reasoning.cost_per_1m_input,
+            config.reasoning.cost_per_1m_output,
+        ) == (1.25, 10.0)
+
+    def test_one_override_leaves_the_other_rate_from_the_yaml(self) -> None:
+        config = _load(UMAI_TRIAGE_COST_PER_1M_OUTPUT="0.40")
+        assert config.triage.cost_per_1m_input == 2.50
+        assert config.triage.cost_per_1m_output == 0.40
+        # The other stage is untouched.
+        assert config.reasoning.cost_per_1m_output == 15.00
+
+    @pytest.mark.parametrize("bad", ["cheap", "-0.5"])
+    def test_a_bad_rate_is_refused(self, bad: str) -> None:
+        with pytest.raises(ConfigError) as exc:
+            _load(UMAI_REASONING_COST_PER_1M_INPUT=bad)
+        assert "UMAI_REASONING_COST_PER_1M_INPUT" in str(exc.value)
+
+    def test_the_override_prices_the_session(self) -> None:
+        from umai.worker.__main__ import _account
+
+        class Outcome:
+            cost_usd = None
+            input_tokens = 1_000_000
+            output_tokens = 1_000_000
+
+        config = _load(
+            UMAI_TRIAGE_COST_PER_1M_INPUT="0.10", UMAI_TRIAGE_COST_PER_1M_OUTPUT="0.40"
+        )
+        assert _account(config, config.triage, Outcome(), "sess-1") == pytest.approx(0.50)
+
+
+ZERO_RATES = {
+    "adr_framework": {
+        "triage_llm": {"model": "local-triage"},
+        "reasoning_agent": {"model": "local-reasoning"},
+    }
+}
+
+
+class TestBudgetNeedsRates:
+    """A budget priced at $0 can never be reached, which is worse than none."""
+
+    @pytest.mark.parametrize(
+        "cap",
+        [
+            "UMAI_MAX_COST_PER_SESSION_USD",
+            "UMAI_MAX_COST_PER_BATCH_USD",
+            "UMAI_MAX_COST_PER_DAY_USD",
+        ],
+    )
+    def test_any_budget_with_zero_rates_is_refused(self, monkeypatch, cap: str) -> None:
+        monkeypatch.setenv(cap, "5")
+        with pytest.raises(ConfigError) as exc:
+            load_worker_config(ZERO_RATES)
+        assert "UMAI_TRIAGE_COST_PER_1M_INPUT" in str(exc.value)
+
+    def test_zero_rates_without_a_budget_are_fine(self) -> None:
+        config = load_worker_config(ZERO_RATES)
+        assert config.triage.cost_per_1m_input == 0.0
+
+    def test_one_zero_rate_is_refused(self) -> None:
+        with pytest.raises(ConfigError) as exc:
+            _load(UMAI_MAX_COST_PER_DAY_USD="5", UMAI_REASONING_COST_PER_1M_OUTPUT="0")
+        assert "reasoning" in str(exc.value)
+
+    def test_env_rates_satisfy_the_check(self, monkeypatch) -> None:
+        for name in (
+            "UMAI_TRIAGE_COST_PER_1M_INPUT",
+            "UMAI_TRIAGE_COST_PER_1M_OUTPUT",
+            "UMAI_REASONING_COST_PER_1M_INPUT",
+            "UMAI_REASONING_COST_PER_1M_OUTPUT",
+        ):
+            monkeypatch.setenv(name, "0.5")
+        monkeypatch.setenv("UMAI_MAX_COST_PER_DAY_USD", "5")
+        assert load_worker_config(ZERO_RATES).budget.enforced is True
+
+    def test_only_the_running_stage_needs_rates(self, monkeypatch) -> None:
+        """A triage worker is not refused over the reasoning stage's pricing."""
+        monkeypatch.setenv("UMAI_TRIAGE_COST_PER_1M_INPUT", "0.1")
+        monkeypatch.setenv("UMAI_TRIAGE_COST_PER_1M_OUTPUT", "0.4")
+        monkeypatch.setenv("UMAI_MAX_COST_PER_DAY_USD", "5")
+
+        assert load_worker_config(ZERO_RATES, stage="triage").budget.enforced
+        with pytest.raises(ConfigError):
+            load_worker_config(ZERO_RATES, stage="reason")
+        with pytest.raises(ConfigError):
+            load_worker_config(ZERO_RATES)
+
+    def test_the_worker_exits_2_on_an_unmeasurable_budget(self, monkeypatch, capsys) -> None:
+        from umai.worker.__main__ import main
+
+        monkeypatch.setenv("UMAI_PLATFORM_ENDPOINT", "http://platform.invalid")
+        monkeypatch.setenv("UMAI_ANALYSIS_WORKER_TOKEN", "token")
+        monkeypatch.setenv("UMAI_MAX_COST_PER_DAY_USD", "5")
+        monkeypatch.setenv("UMAI_TRIAGE_COST_PER_1M_INPUT", "0")
+
+        assert main(["--stage", "triage", "--once"]) == 2
+        assert "Configuration error" in capsys.readouterr().err
 
 
 class TestPricing:

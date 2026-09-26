@@ -1,14 +1,19 @@
 """Tests for the UMAI ingest transport."""
 
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from adr_sensor import transport
 from adr_sensor.schemas.agent_event_schema import AgentEvent, ChatMessage
 from adr_sensor.transport import (
     IngestClient,
     IngestConfig,
+    SendResult,
     SessionState,
+    apply_session_cap,
+    ship,
     state_key,
 )
 
@@ -200,6 +205,110 @@ class TestConfig:
         monkeypatch.setenv("UMAI_INGEST_TIMEOUT_SECONDS", "not-a-number")
 
         assert IngestConfig.from_env().timeout == 60
+
+
+def make_dated_event(i):
+    """Session `i`; a higher index is a newer session."""
+    return AgentEvent(
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(hours=i),
+        source="claude",
+        session_id=f"s{i:02d}",
+        chat_history=[ChatMessage(role="user", content=f"message {i}")],
+        raw_log_path=f"/logs/s{i:02d}.jsonl",
+        hostname="test-host",
+        username="tester",
+    )
+
+
+class TestPerRunCap:
+    """UMAI (WS3.3): the backfill brake. Each landed session costs a triage call."""
+
+    @pytest.fixture
+    def harness(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("UMAI_ADR_STATE_DIR", str(tmp_path))
+        posted = []
+
+        def fake_post(self, body):
+            posted.append([s["session_id"] for s in body["sessions"]])
+
+        monkeypatch.setattr(transport.IngestClient, "_post", fake_post)
+        heartbeats = []
+        monkeypatch.setattr(
+            transport.IngestClient, "heartbeat", lambda self, **kw: heartbeats.append(kw) or {}
+        )
+        config = IngestConfig(endpoint="https://example.invalid", device_token="t", max_sessions_per_run=10)
+        return config, posted, heartbeats, tmp_path / "state.json"
+
+    def test_cap_sends_newest_first_and_defers_the_rest(self, harness, capsys):
+        config, posted, heartbeats, state_path = harness
+        sessions = [make_dated_event(i) for i in range(50)]
+
+        result = ship(sessions, config)
+
+        sent = [sid for batch in posted for sid in batch]
+        assert sent == [f"s{i:02d}" for i in range(49, 39, -1)]
+        assert result.sessions_sent == 10
+        assert result.sessions_deferred == 40
+        assert heartbeats[-1]["pending_sessions"] == 40
+        assert "deferring 40 to later runs" in capsys.readouterr().out
+
+        # only what was sent has a hash in state.json
+        recorded = set(json.loads(state_path.read_text(encoding="utf-8"))["sent"])
+        assert recorded == {state_key(s) for s in sessions[40:]}
+
+    def test_deferred_sessions_ship_on_later_runs(self, harness):
+        config, posted, _, state_path = harness
+        sessions = [make_dated_event(i) for i in range(50)]
+
+        runs = []
+        for _ in range(6):
+            posted.clear()
+            result = ship(sessions, config)
+            runs.append((result.sessions_sent, result.sessions_deferred, result.sessions_skipped))
+
+        assert runs == [(10, 40, 0), (10, 30, 10), (10, 20, 20), (10, 10, 30), (10, 0, 40), (0, 0, 50)]
+        recorded = set(json.loads(state_path.read_text(encoding="utf-8"))["sent"])
+        assert recorded == {state_key(s) for s in sessions}
+
+    def test_second_run_sends_the_next_newest(self, harness):
+        config, posted, _, _ = harness
+        sessions = [make_dated_event(i) for i in range(50)]
+        ship(sessions, config)
+        posted.clear()
+
+        ship(sessions, config)
+
+        assert [sid for batch in posted for sid in batch] == [f"s{i:02d}" for i in range(39, 29, -1)]
+
+    def test_zero_means_unlimited(self, harness):
+        config, posted, _, _ = harness
+        config.max_sessions_per_run = 0
+
+        result = ship([make_dated_event(i) for i in range(50)], config)
+
+        assert result.sessions_sent == 50 and result.sessions_deferred == 0
+
+    def test_apply_session_cap_leaves_small_sets_untouched(self):
+        sessions = [make_dated_event(i) for i in range(3)]
+        now, later = apply_session_cap(sessions, 10)
+        assert now is sessions and later == []
+
+    def test_env_configures_the_cap(self, monkeypatch):
+        monkeypatch.setenv("UMAI_INGEST_ENDPOINT", "https://umai.example.com")
+        monkeypatch.setenv("UMAI_DEVICE_TOKEN", "token")
+
+        monkeypatch.delenv("UMAI_INGEST_MAX_SESSIONS_PER_RUN", raising=False)
+        assert IngestConfig.from_env().max_sessions_per_run == 0
+
+        monkeypatch.setenv("UMAI_INGEST_MAX_SESSIONS_PER_RUN", "25")
+        assert IngestConfig.from_env().max_sessions_per_run == 25
+
+        for bad in ("-5", "lots"):
+            monkeypatch.setenv("UMAI_INGEST_MAX_SESSIONS_PER_RUN", bad)
+            assert IngestConfig.from_env().max_sessions_per_run == 0
+
+    def test_send_result_defaults_to_nothing_deferred(self):
+        assert SendResult().sessions_deferred == 0
 
 
 if __name__ == "__main__":

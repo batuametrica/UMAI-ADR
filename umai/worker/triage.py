@@ -186,8 +186,18 @@ class TriageRunner:
 
         cost = None
         try:
-            rates = self._config.get_triage_rates()
-            cost = self._calculate_cost(*rates, result.input_tokens, result.output_tokens)
+            if self._stage is not None:
+                # The worker's configured rates (env override, else the
+                # detector config), the same ones the budget was validated
+                # against. Upstream's get_triage_rates() only ever reads the
+                # yaml section and would ignore an override.
+                cost = self._stage.price(
+                    getattr(result, "input_tokens", 0) or 0,
+                    getattr(result, "output_tokens", 0) or 0,
+                )
+            else:
+                rates = self._config.get_triage_rates()
+                cost = self._calculate_cost(*rates, result.input_tokens, result.output_tokens)
         except Exception:
             pass
 

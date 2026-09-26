@@ -52,14 +52,14 @@ class AgentObserver:
             output_dir: Directory to save output files. Defaults to ./output.
             max_age_days: Maximum age of logs to process. None uses parser defaults (14 days).
         """
-        self.claude_parser = ClaudeParser(max_age_days=max_age_days) if max_age_days is not None else ClaudeParser()
-        self.cursor_parser = CursorParser(max_age_days=max_age_days) if max_age_days is not None else CursorParser()
-        self.claude_desktop_parser = (
-            ClaudeDesktopParser(max_age_days=max_age_days) if max_age_days is not None else ClaudeDesktopParser()
-        )
-        self.codex_parser = CodexParser()
-        self.cline_parser = ClineParser()
-        self.warp_parser = WarpParser()
+        # UMAI: every parser gets the same window; None resolves to
+        # BaseParser.DEFAULT_MAX_AGE_DAYS inside each parser.
+        self.claude_parser = ClaudeParser(max_age_days=max_age_days)
+        self.cursor_parser = CursorParser(max_age_days=max_age_days)
+        self.claude_desktop_parser = ClaudeDesktopParser(max_age_days=max_age_days)
+        self.codex_parser = CodexParser(max_age_days=max_age_days)
+        self.cline_parser = ClineParser(max_age_days=max_age_days)
+        self.warp_parser = WarpParser(max_age_days=max_age_days)
 
         self.output_dir = output_dir if output_dir else Path("output")
         self.output_dir.mkdir(exist_ok=True)

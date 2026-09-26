@@ -17,7 +17,7 @@ Performance-optimized: Skips sessions older than 2 weeks based on lastActivityAt
 """
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -37,7 +37,10 @@ DEFAULT_BASE_PATH = "~/Library/Application Support/Claude/local-agent-mode-sessi
 class ClaudeDesktopParser(BaseParser):
     """Parser for Claude Desktop Agent Mode sessions (both on-disk layouts)."""
 
-    def __init__(self, max_age_days: int = MAX_LOG_AGE_DAYS, base_path: Optional[str] = None):
+    DEFAULT_MAX_AGE_DAYS = MAX_LOG_AGE_DAYS
+
+    def __init__(self, max_age_days: Optional[int] = None, base_path: Optional[str] = None):
+        super().__init__(max_age_days)
         # UMAI: layout and root now resolve per platform. An explicit base_path
         # still wins and is assumed to be the macOS audit.jsonl layout, which is
         # what upstream callers and the existing tests pass.
@@ -51,8 +54,6 @@ class ClaudeDesktopParser(BaseParser):
             else:
                 self.layout = platform_paths.LAYOUT_AUDIT_JSONL
                 self.base_path = Path(DEFAULT_BASE_PATH).expanduser()
-
-        self.max_age_days = max_age_days
 
         # UMAI: Claude Code transcript files consumed by the sidecar layout.
         # The observer drops the duplicate `claude`-sourced copy of exactly
@@ -82,7 +83,6 @@ class ClaudeDesktopParser(BaseParser):
         session_dirs = self._discover_sessions()
         print(f"[CLAUDE_DESKTOP] Found {len(session_dirs)} session directories")
 
-        cutoff_time = datetime.now(timezone.utc) - timedelta(days=self.max_age_days)
         skipped_count = 0
         processed_count = 0
 
@@ -96,7 +96,7 @@ class ClaudeDesktopParser(BaseParser):
                 if last_activity is not None:
                     try:
                         activity_time = datetime.fromtimestamp(last_activity / 1000, tz=timezone.utc)
-                        if activity_time < cutoff_time:
+                        if not self._is_recent(activity_time):
                             skipped_count += 1
                             continue
                     except (ValueError, OSError, OverflowError):
@@ -114,8 +114,7 @@ class ClaudeDesktopParser(BaseParser):
             except Exception as e:
                 print(f"[CLAUDE_DESKTOP] Error parsing session {session_dir}: {e}")
 
-        if skipped_count > 0:
-            print(f"[CLAUDE_DESKTOP] Skipped {skipped_count} sessions older than {self.max_age_days} days")
+        self._report_skipped("CLAUDE_DESKTOP", skipped_count, "sessions")
         print(f"[CLAUDE_DESKTOP] Processed {processed_count} sessions")
 
         return entries
@@ -129,7 +128,6 @@ class ClaudeDesktopParser(BaseParser):
         sidecars = sorted(self.base_path.glob("*/*/local_*.json"))
         print(f"[CLAUDE_DESKTOP] Found {len(sidecars)} session sidecars")
 
-        cutoff_time = datetime.now(timezone.utc) - timedelta(days=self.max_age_days)
         entries = []
         skipped_count = 0
         unresolved_count = 0
@@ -140,7 +138,7 @@ class ClaudeDesktopParser(BaseParser):
                 continue
 
             timestamp = self._sidecar_timestamp(metadata, sidecar_path)
-            if timestamp < cutoff_time:
+            if not self._is_recent(timestamp):
                 skipped_count += 1
                 continue
 
@@ -152,8 +150,7 @@ class ClaudeDesktopParser(BaseParser):
             if entry.has_meaningful_content():
                 entries.append(entry)
 
-        if skipped_count:
-            print(f"[CLAUDE_DESKTOP] Skipped {skipped_count} sessions older than {self.max_age_days} days")
+        self._report_skipped("CLAUDE_DESKTOP", skipped_count, "sessions")
         if unresolved_count:
             print(f"[CLAUDE_DESKTOP] {unresolved_count} sidecars had no matching transcript")
         print(f"[CLAUDE_DESKTOP] Processed {len(entries)} sessions")

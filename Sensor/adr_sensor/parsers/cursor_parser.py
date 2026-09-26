@@ -2,17 +2,18 @@
 Parser for Cursor IDE logs.
 Extracts composerData from SQLite database.
 
-Supports both macOS and Linux paths.
+Supports Windows, macOS and Linux paths (via platform_paths).
 Memory-optimized: Uses cursor iteration instead of fetchall().
 Performance-optimized: Skips conversations older than 2 weeks.
 """
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+from .. import platform_paths
 from ..schemas.agent_event_schema import AgentEvent, ChatMessage, ToolUsage
 from ..utils.string_utils import truncate_middle
 from ..utils.timestamp_utils import normalize_timestamp
@@ -25,19 +26,26 @@ MAX_CONVERSATION_AGE_DAYS = 14
 class CursorParser(BaseParser):
     """Parser for Cursor SQLite database logs."""
 
-    def __init__(self, max_age_days: int = MAX_CONVERSATION_AGE_DAYS):
-        # Support macOS and Linux paths
-        macos_path = Path.home() / "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
-        linux_path = Path.home() / ".config/Cursor/User/globalStorage/state.vscdb"
-        if macos_path.exists():
-            self.db_path = macos_path
+    DEFAULT_MAX_AGE_DAYS = MAX_CONVERSATION_AGE_DAYS
+
+    def __init__(self, max_age_days: Optional[int] = None, db_path: Optional[str] = None):
+        super().__init__(max_age_days)
+        # UMAI: upstream probed macOS and fell back to ~/.config, so Windows
+        # (%APPDATA%\Cursor) was never found. An explicit db_path still wins.
+        self.db_path: Optional[Path]
+        if db_path:
+            self.db_path = Path(db_path)
         else:
-            self.db_path = linux_path
-        self.max_age_days = max_age_days
+            found = platform_paths.cursor_state_db()
+            self.db_path = found[0] if found else None
 
     def parse_all(self) -> List[AgentEvent]:
         """Parse all available Cursor logs."""
         entries = []
+
+        if self.db_path is None:
+            print("[CURSOR] No database found in any Cursor profile")
+            return entries
 
         if not self.db_path.exists():
             print(f"[CURSOR] No database found at {self.db_path}")
@@ -61,7 +69,6 @@ class CursorParser(BaseParser):
 
             composer_metadata = self.get_composer_metadata(cursor)
 
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=self.max_age_days)
             recent_conv_ids = set()
             skipped_count = 0
 
@@ -78,13 +85,12 @@ class CursorParser(BaseParser):
                     except Exception:
                         pass
 
-                if conv_timestamp is None or conv_timestamp >= cutoff_time:
+                if self._is_recent(conv_timestamp):
                     recent_conv_ids.add(conv_id)
                 else:
                     skipped_count += 1
 
-            if skipped_count > 0:
-                print(f"[CURSOR] Skipped {skipped_count} conversations older than {self.max_age_days} days")
+            self._report_skipped("CURSOR", skipped_count, "conversations")
 
             cursor.execute("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
 

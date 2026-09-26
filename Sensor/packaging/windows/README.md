@@ -28,6 +28,24 @@ returned device token is written as a Windows DPAPI LocalMachine blob; it never 
 in `device.json`, installer logs, or support bundles. Add `-ProxyUrl` and
 `-CaBundlePath` for an enterprise proxy or a PEM private-CA bundle.
 
+## Backfill brakes
+
+The task runs every source (`--source everything`), and each session that reaches
+UMAI costs a triage LLM call. Two limits stop a first run on a long-used machine
+from flooding the workers:
+
+- **Age window.** Every parser skips sessions older than 14 days, judged by file
+  mtime or the agent's own last-activity time. `--all-history` lifts the window; the
+  scheduled task never passes it.
+- **Per-run send cap.** `-MaxSessionsPerRun` (default `25`, `0` = unlimited) is
+  written to `collector.json` as `max_sessions_per_run`. `Run-Collector.ps1` exports
+  it as `UMAI_INGEST_MAX_SESSIONS_PER_RUN`, and the enrollment run uses it too. Each
+  run sends the newest changed sessions up to the cap. The rest are not recorded as
+  sent, so they go on the following runs: at 25 per 15-minute run, a device sends at
+  most 100 sessions an hour. A `collector.json` written before this setting existed
+  gets 25. To change the cap on an enrolled device, edit `max_sessions_per_run` in
+  `%ProgramData%\UMAI\ADR Collector\config\collector.json`.
+
 ## Upgrade, rollback, and uninstall
 
 An in-place MSI major upgrade replaces binaries and scripts while preserving the

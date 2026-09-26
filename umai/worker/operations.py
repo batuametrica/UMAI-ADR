@@ -23,6 +23,12 @@ class RuntimeState:
     queue_age_seconds: float = 0.0
     last_success_at: float = 0.0
     batch_duration_seconds: float = 0.0
+    # Daily cost budget (UMAI_MAX_COST_PER_DAY_USD). Paused is not unready:
+    # the worker is healthy and connected, it has just stopped claiming.
+    budget_paused: bool = False
+    daily_budget_usd: float = 0.0
+    daily_spend_usd: float = 0.0
+    budget_stops_total: int = 0
 
     def prometheus(self) -> str:
         labels = f'stage="{self.stage}"'
@@ -39,6 +45,10 @@ class RuntimeState:
             ("umai_worker_queue_age_seconds", self.queue_age_seconds),
             ("umai_worker_last_success_timestamp_seconds", self.last_success_at),
             ("umai_worker_batch_duration_seconds", self.batch_duration_seconds),
+            ("umai_worker_budget_paused", int(self.budget_paused)),
+            ("umai_worker_daily_budget_usd", self.daily_budget_usd),
+            ("umai_worker_daily_spend_usd", self.daily_spend_usd),
+            ("umai_worker_budget_stops_total", self.budget_stops_total),
         ]
         return "\n".join(f"{name}{{{labels}}} {value}" for name, value in values) + "\n"
 
@@ -50,7 +60,12 @@ def start_operations_server(state: RuntimeState, host: str, port: int) -> Thread
                 self._reply(200, b'{"status":"ok"}\n', "application/json")
             elif self.path == "/readyz":
                 code = 200 if state.ready else 503
-                body = b'{"status":"ready"}\n' if state.ready else b'{"status":"not_ready"}\n'
+                if not state.ready:
+                    body = b'{"status":"not_ready"}\n'
+                elif state.budget_paused:
+                    body = b'{"status":"ready","paused":"daily_budget"}\n'
+                else:
+                    body = b'{"status":"ready"}\n'
                 self._reply(code, body, "application/json")
             elif self.path == "/metrics":
                 self._reply(200, state.prometheus().encode("utf-8"), "text/plain; version=0.0.4")

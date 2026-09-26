@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory = $true)][guid]$TenantId,
     [Parameter(Mandatory = $true)][Security.SecureString]$BootstrapToken,
     [string]$ProxyUrl,
-    [string]$CaBundlePath
+    [string]$CaBundlePath,
+    # Sessions sent per scheduled run; 0 = unlimited. Bounds the first-run backfill.
+    [ValidateRange(0, 100000)][int]$MaxSessionsPerRun = 25
 )
 $ErrorActionPreference = 'Stop'
 $dataRoot = Join-Path $env:ProgramData 'UMAI\ADR Collector'
@@ -19,6 +21,7 @@ $config = [ordered]@{
     tenant_id = $TenantId.ToString()
     proxy_url = $ProxyUrl
     ca_bundle_path = $CaBundlePath
+    max_sessions_per_run = $MaxSessionsPerRun
 }
 $config | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $configDir 'collector.json') -Encoding UTF8
 
@@ -28,6 +31,7 @@ try {
     $env:UMAI_TENANT_ID = $config.tenant_id
     $env:UMAI_BOOTSTRAP_TOKEN = $token
     $env:UMAI_ADR_STATE_DIR = $stateDir
+    $env:UMAI_INGEST_MAX_SESSIONS_PER_RUN = [string]$MaxSessionsPerRun
     if ($ProxyUrl) { $env:UMAI_HTTPS_PROXY = $ProxyUrl }
     if ($CaBundlePath) { $env:UMAI_CA_BUNDLE = $CaBundlePath }
     & $collector --send --no-save --source everything

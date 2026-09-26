@@ -28,6 +28,10 @@ DEFAULT_REASONING_TIMEOUT_S = 300.0
 # for a customer who did not ask for one.
 DEFAULT_MAX_COST_PER_SESSION_USD = 0.0
 DEFAULT_MAX_COST_PER_BATCH_USD = 0.0
+DEFAULT_MAX_COST_PER_DAY_USD = 0.0
+
+# Stages whose spend each budget measures, keyed by the CLI --stage value.
+_STAGE_NAMES = {"triage": "triage", "reason": "reasoning", "reasoning": "reasoning"}
 
 
 class ConfigError(RuntimeError):
@@ -63,10 +67,17 @@ class StageConfig:
 class BudgetConfig:
     max_cost_per_session_usd: float = DEFAULT_MAX_COST_PER_SESSION_USD
     max_cost_per_batch_usd: float = DEFAULT_MAX_COST_PER_BATCH_USD
+    # Cumulative per worker process per UTC day. Unlike the batch cap it does
+    # not reset when a new batch is claimed, so it is the real ceiling.
+    max_cost_per_day_usd: float = DEFAULT_MAX_COST_PER_DAY_USD
 
     @property
     def enforced(self) -> bool:
-        return bool(self.max_cost_per_session_usd or self.max_cost_per_batch_usd)
+        return bool(
+            self.max_cost_per_session_usd
+            or self.max_cost_per_batch_usd
+            or self.max_cost_per_day_usd
+        )
 
 
 @dataclass(frozen=True)
@@ -92,7 +103,8 @@ class WorkerConfig:
             lines.append(
                 "budget: "
                 f"session=${self.budget.max_cost_per_session_usd:.4f} "
-                f"batch=${self.budget.max_cost_per_batch_usd:.4f}"
+                f"batch=${self.budget.max_cost_per_batch_usd:.4f} "
+                f"day=${self.budget.max_cost_per_day_usd:.4f}"
             )
         return lines
 
@@ -215,8 +227,11 @@ def _stage_config(
         base_url=base_url,
         api_key=api_key,
         timeout_s=_positive_timeout(f"{env_prefix}_TIMEOUT_SECONDS", default_timeout),
-        cost_per_1m_input=default_rates[0],
-        cost_per_1m_output=default_rates[1],
+        # The detector config's rates belong to the model named in that file,
+        # not necessarily to the one configured here, so the operator can set
+        # the price of the model they actually run.
+        cost_per_1m_input=_float(f"{env_prefix}_COST_PER_1M_INPUT", default_rates[0]),
+        cost_per_1m_output=_float(f"{env_prefix}_COST_PER_1M_OUTPUT", default_rates[1]),
     )
 
 
@@ -242,15 +257,51 @@ def _rates(section: dict[str, Any]) -> tuple[float, float]:
         )
     except (TypeError, ValueError):
         # Bad pricing must not stop analysis; it only makes the cost figure
-        # wrong, and the budget check below notices a zero rate.
+        # wrong, and _check_budget_can_measure refuses a zero rate when a
+        # budget depends on it.
         return (0.0, 0.0)
 
 
-def load_worker_config(detector_config: Optional[dict[str, Any]] = None) -> WorkerConfig:
+def _check_budget_can_measure(
+    budget: BudgetConfig, stages: list[StageConfig]
+) -> None:
+    """Refuse a budget that prices the work at zero.
+
+    A session is priced from its token counts and the stage's rates. With the
+    rates at zero every session costs $0, so every cap is silently never
+    reached — which is worse than no cap, because the operator believes spend
+    is bounded. One zero rate is refused too: it drops that side of every
+    session from the total, and output is usually the expensive side.
+    """
+    if not budget.enforced:
+        return
+    for stage in stages:
+        if stage.cost_per_1m_input <= 0 or stage.cost_per_1m_output <= 0:
+            prefix = "UMAI_TRIAGE" if stage.stage == "triage" else "UMAI_REASONING"
+            raise ConfigError(
+                f"A cost budget is set but the {stage.stage} stage has a zero "
+                "token rate, so sessions would be under-priced (or priced at $0) "
+                "and the budget might never be reached. "
+                f"Set {prefix}_COST_PER_1M_INPUT and "
+                f"{prefix}_COST_PER_1M_OUTPUT to the price of {stage.model}, or "
+                "unset UMAI_MAX_COST_PER_SESSION_USD, UMAI_MAX_COST_PER_BATCH_USD "
+                "and UMAI_MAX_COST_PER_DAY_USD."
+            )
+
+
+def load_worker_config(
+    detector_config: Optional[dict[str, Any]] = None, *, stage: Optional[str] = None
+) -> WorkerConfig:
     """Build and validate the whole worker configuration.
+
+    `stage` is the stage this process will run (the CLI `--stage`). Budget
+    rates are only required for that stage; without it both are checked.
 
     Raises ConfigError with a message aimed at whoever has to fix it.
     """
+    if stage is not None and stage not in _STAGE_NAMES:
+        raise ConfigError(f"Unknown analysis stage: {stage!r}")
+
     # Before anything reads the environment, and well before the first client
     # is built.
     clear_blank_sdk_env()
@@ -290,6 +341,9 @@ def load_worker_config(detector_config: Optional[dict[str, Any]] = None) -> Work
         max_cost_per_batch_usd=_float(
             "UMAI_MAX_COST_PER_BATCH_USD", DEFAULT_MAX_COST_PER_BATCH_USD
         ),
+        max_cost_per_day_usd=_float(
+            "UMAI_MAX_COST_PER_DAY_USD", DEFAULT_MAX_COST_PER_DAY_USD
+        ),
     )
     if (
         budget.max_cost_per_batch_usd
@@ -301,6 +355,23 @@ def load_worker_config(detector_config: Optional[dict[str, Any]] = None) -> Work
             "so the batch budget would be exhausted before a single session could "
             "complete."
         )
+    day_cap = budget.max_cost_per_day_usd
+    if day_cap:
+        for name, cap in (
+            ("UMAI_MAX_COST_PER_SESSION_USD", budget.max_cost_per_session_usd),
+            ("UMAI_MAX_COST_PER_BATCH_USD", budget.max_cost_per_batch_usd),
+        ):
+            if cap and day_cap < cap:
+                raise ConfigError(
+                    f"UMAI_MAX_COST_PER_DAY_USD is below {name}, so the daily "
+                    "budget would always be exhausted first and the smaller cap "
+                    "would have no effect."
+                )
+
+    measured = [triage, reasoning]
+    if stage is not None:
+        measured = [triage if _STAGE_NAMES[stage] == "triage" else reasoning]
+    _check_budget_can_measure(budget, measured)
 
     return WorkerConfig(
         triage=triage,

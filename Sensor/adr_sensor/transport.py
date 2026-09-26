@@ -37,6 +37,8 @@ from .schemas.agent_event_schema import AgentEvent
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_BATCH_BYTES = 8 * 1024 * 1024  # keep a single request modest
 DEFAULT_MAX_ATTEMPTS = 4
+# 0 = unlimited. The Windows packaging sets a fleet value in collector.json.
+DEFAULT_MAX_SESSIONS_PER_RUN = 0
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 
@@ -49,6 +51,8 @@ class SendResult:
     sessions_sent: int = 0
     batches_sent: int = 0
     sessions_skipped: int = 0
+    # UMAI: changed sessions held back by the per-run cap; they ship next run.
+    sessions_deferred: int = 0
     errors: List[str] = field(default_factory=list)
 
     @property
@@ -71,6 +75,10 @@ class IngestConfig:
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    # UMAI: upper bound on sessions sent per run, 0 = unlimited. Every session
+    # that lands costs a triage LLM call, so this is the backfill brake for a
+    # first run over months of history.
+    max_sessions_per_run: int = DEFAULT_MAX_SESSIONS_PER_RUN
     # Most restrictive by default: a config that failed to load must not be the
     # reason transcripts leave the machine.
     collection_mode: str = MODE_POSTURE_ONLY
@@ -132,6 +140,9 @@ class IngestConfig:
             timeout=timeout,
             max_batch_bytes=_int("UMAI_INGEST_MAX_BATCH_BYTES", DEFAULT_MAX_BATCH_BYTES),
             max_attempts=_int("UMAI_INGEST_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS),
+            max_sessions_per_run=max(
+                _int("UMAI_INGEST_MAX_SESSIONS_PER_RUN", DEFAULT_MAX_SESSIONS_PER_RUN), 0
+            ),
         )
 
 
@@ -417,6 +428,28 @@ class IngestClient:
 # ---------------------------------------------------------------------------
 
 
+def _newest_first(sessions: List[AgentEvent]) -> List[AgentEvent]:
+    def key(session: AgentEvent) -> datetime:
+        ts = session.timestamp
+        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+    return sorted(sessions, key=key, reverse=True)
+
+
+def apply_session_cap(
+    pending: List[AgentEvent], max_sessions: int
+) -> Tuple[List[AgentEvent], List[AgentEvent]]:
+    """Split pending sessions into (send now, defer), newest first.
+
+    Deferred sessions are simply not marked sent, so the next run finds them
+    pending again. 0 or less means no cap.
+    """
+    if max_sessions <= 0 or len(pending) <= max_sessions:
+        return pending, []
+    ordered = _newest_first(pending)
+    return ordered[:max_sessions], ordered[max_sessions:]
+
+
 def ship(sessions: List[AgentEvent], config: Optional[IngestConfig] = None) -> SendResult:
     """Send sessions that changed since the last successful run."""
     config = config or IngestConfig.from_env()
@@ -425,10 +458,17 @@ def ship(sessions: List[AgentEvent], config: Optional[IngestConfig] = None) -> S
 
     state = SessionState()
     pending, skipped = state.pending(sessions)
+    pending, deferred = apply_session_cap(pending, config.max_sessions_per_run)
+    if deferred:
+        print(
+            f"[TRANSPORT] Per-run cap {config.max_sessions_per_run}: sending the newest "
+            f"{len(pending)} session(s), deferring {len(deferred)} to later runs"
+        )
 
     client = IngestClient(config)
     result = client.send(pending)
     result.sessions_skipped = skipped
+    result.sessions_deferred = len(deferred)
 
     # Only record what actually landed. A partial failure re-sends the tail next
     # run; the ingest side dedupes on session id + content hash.
@@ -438,7 +478,7 @@ def ship(sessions: List[AgentEvent], config: Optional[IngestConfig] = None) -> S
 
     state.save()
 
-    pending_count = max(len(pending) - result.sessions_sent, 0)
+    pending_count = max(len(pending) - result.sessions_sent, 0) + len(deferred)
     if result.errors and result.sessions_sent:
         health_status, detail = "degraded", "PARTIAL_INGEST"
     elif result.errors:

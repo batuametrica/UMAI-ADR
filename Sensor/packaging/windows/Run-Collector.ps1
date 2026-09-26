@@ -15,6 +15,11 @@ $env:UMAI_INGEST_ENDPOINT = [string]$config.endpoint
 $env:UMAI_TENANT_ID = [string]$config.tenant_id
 if ($config.proxy_url) { $env:UMAI_HTTPS_PROXY = [string]$config.proxy_url }
 if ($config.ca_bundle_path) { $env:UMAI_CA_BUNDLE = [string]$config.ca_bundle_path }
+# Per-run send cap (backfill brake). Configs written before the field existed
+# get the fleet default; an explicit 0 means unlimited.
+$maxSessions = 25
+if ($null -ne $config.max_sessions_per_run) { $maxSessions = [int]$config.max_sessions_per_run }
+$env:UMAI_INGEST_MAX_SESSIONS_PER_RUN = [string]$maxSessions
 $env:UMAI_ADR_STATE_DIR = Join-Path $dataRoot 'state'
 $env:UMAI_ADR_DATA_DIR = $dataRoot
 

@@ -170,3 +170,45 @@ class TestAgentObserver:
         # Should not raise
         entries, configs = observer.ingest_all(source_filter="claude")
         assert entries == []
+
+
+PARSER_CLASSES = (
+    "ClaudeParser",
+    "CursorParser",
+    "ClaudeDesktopParser",
+    "CodexParser",
+    "ClineParser",
+    "WarpParser",
+)
+
+
+class TestObserverAgeWindow:
+    """UMAI: the Windows task runs `--source everything`, so a parser left on its
+    own default would backfill its whole history. All six get the same value."""
+
+    @pytest.mark.parametrize("max_age_days", [None, 5, 10000])
+    def test_max_age_days_reaches_all_six_parsers(self, tmp_path, max_age_days):
+        mocks = {name: MagicMock(name=name) for name in PARSER_CLASSES}
+        patchers = [patch(f"adr_sensor.observer.{name}", mock) for name, mock in mocks.items()]
+        for p in patchers:
+            p.start()
+        try:
+            AgentObserver(output_dir=tmp_path, max_age_days=max_age_days)
+        finally:
+            for p in patchers:
+                p.stop()
+
+        for name, mock in mocks.items():
+            mock.assert_called_once_with(max_age_days=max_age_days)
+
+    def test_default_resolves_to_fourteen_days_everywhere(self, tmp_path):
+        observer = AgentObserver(output_dir=tmp_path)
+        parsers = [
+            observer.claude_parser,
+            observer.cursor_parser,
+            observer.claude_desktop_parser,
+            observer.codex_parser,
+            observer.cline_parser,
+            observer.warp_parser,
+        ]
+        assert [p.max_age_days for p in parsers] == [14] * 6

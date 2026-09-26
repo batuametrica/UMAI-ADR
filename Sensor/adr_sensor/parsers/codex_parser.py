@@ -1,6 +1,6 @@
 """
 Parser for OpenAI Codex CLI logs.
-Reads JSONL files from ~/.codex/sessions/
+Reads JSONL files from $CODEX_HOME/sessions, else ~/.codex/sessions/
 """
 
 import json
@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .. import platform_paths
 from ..schemas.agent_event_schema import AgentEvent, ChatMessage, ToolUsage
 from ..utils.string_utils import truncate_middle
 from ..utils.timestamp_utils import normalize_timestamp
@@ -18,8 +19,15 @@ from .base_parser import BaseParser
 class CodexParser(BaseParser):
     """Parser for OpenAI Codex CLI JSONL log files."""
 
-    def __init__(self):
-        self.base_path = Path.home() / ".codex/sessions"
+    def __init__(self, max_age_days: Optional[int] = None, base_path: Optional[str] = None):
+        super().__init__(max_age_days)
+        # UMAI: honour CODEX_HOME. The ~/.codex default is kept for the
+        # "No logs found" message when nothing exists.
+        if base_path:
+            self.base_path = Path(base_path)
+        else:
+            found = platform_paths.codex_sessions()
+            self.base_path = found[0] if found else Path.home() / ".codex/sessions"
 
     def parse_all(self) -> List[AgentEvent]:
         """Parse all available Codex logs."""
@@ -32,7 +40,12 @@ class CodexParser(BaseParser):
         jsonl_files = list(self.base_path.glob("**/*.jsonl"))
         print(f"[CODEX] Found {len(jsonl_files)} JSONL files")
 
-        for jsonl_file in jsonl_files:
+        # UMAI: rollout files are appended while a session runs, so mtime is
+        # the last-activity time.
+        recent_files = [f for f in jsonl_files if self._is_recent_mtime(f)]
+        self._report_skipped("CODEX", len(jsonl_files) - len(recent_files), "files")
+
+        for jsonl_file in recent_files:
             try:
                 entry = self.parse_jsonl_file(jsonl_file)
                 if entry and entry.has_meaningful_content():
